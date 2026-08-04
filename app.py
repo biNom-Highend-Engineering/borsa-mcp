@@ -9,17 +9,28 @@ The MCP server will be available at:
 """
 
 from starlette.responses import JSONResponse
+from health import check_dependencies, dependencies_for
 from unified_mcp_server import app as mcp
 
 # Add health check endpoint to the MCP server
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     """Health check endpoint for Dokploy and other monitoring services"""
-    return JSONResponse({
-        "status": "healthy",
-        "service": "Borsa MCP Server",
-        "version": "0.9.0"
-    })
+    requested_services = request.query_params.get("service")
+    try:
+        dependencies = (
+            dependencies_for(requested_services.split(","))
+            if requested_services
+            else None
+        )
+    except ValueError as exc:
+        return JSONResponse(
+            {"status": "error", "message": str(exc)},
+            status_code=400,
+        )
+
+    body, status_code = await check_dependencies(dependencies=dependencies)
+    return JSONResponse(body, status_code=status_code)
 
 # Create ASGI app directly from FastMCP server
 # This avoids routing issues with nested mounts
