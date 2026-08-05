@@ -18,18 +18,24 @@ async def health_check(request):
     """Health check endpoint for Dokploy and other monitoring services"""
     requested_services = request.query_params.get("service")
     try:
-        dependencies = (
-            dependencies_for(requested_services.split(","))
-            if requested_services
-            else None
-        )
+        if not requested_services:
+            # The default readiness check covers both the MCP tool surface and
+            # every registered external service used by those tools.
+            dependencies = None
+        elif requested_services.strip().lower() == "all":
+            dependencies = None
+        else:
+            dependencies = dependencies_for(requested_services.split(","))
     except ValueError as exc:
         return JSONResponse(
             {"status": "error", "message": str(exc)},
             status_code=400,
         )
 
-    body, status_code = await check_dependencies(dependencies=dependencies)
+    body, status_code = await check_dependencies(
+        dependencies=dependencies,
+        mcp_app=mcp,
+    )
     return JSONResponse(body, status_code=status_code)
 
 # Create ASGI app directly from FastMCP server
@@ -38,5 +44,7 @@ app = mcp.http_app()
 
 # Endpoints:
 # - /mcp/ - MCP server (Streamable HTTP transport, default FastMCP path)
-# - /health - Health check for monitoring
+# - /health - MCP readiness plus every registered upstream check
+# - /health?service=yahoo_finance,tcmb - readiness plus selected upstream checks
+# - /health?service=all - readiness plus every registered upstream check
 # Run with: uvicorn app:app --host 0.0.0.0 --port 8000

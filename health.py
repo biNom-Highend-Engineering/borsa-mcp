@@ -15,6 +15,41 @@ import httpx
 ResponseValidator = Callable[[httpx.Response], None]
 
 
+# This is the public MCP surface, not merely a tool count. A count-only check can
+# stay green when one tool is accidentally removed and another is accidentally
+# added. Keep this set in sync deliberately when the public contract changes.
+EXPECTED_TOOL_NAMES = frozenset(
+    {
+        "search_symbol",
+        "get_profile",
+        "get_quote",
+        "get_historical_data",
+        "get_technical_analysis",
+        "get_analyst_data",
+        "get_earnings",
+        "get_financial_statements",
+        "get_financial_ratios",
+        "get_corporate_actions",
+        "get_news",
+        "screen_securities",
+        "scan_stocks",
+        "compare_assets",
+        "get_sector_comparison",
+        "get_crypto_market",
+        "get_economic_calendar",
+        "get_bond_yields",
+        "get_fund_data",
+        "screen_funds",
+        "get_index_data",
+        "get_macro_data",
+        "get_evds_data",
+    }
+)
+
+MCP_SMOKE_TOOL = "scan_stocks"
+MCP_SMOKE_ARGUMENTS = {"help": True}
+
+
 @dataclass(frozen=True)
 class Dependency:
     name: str
@@ -373,13 +408,72 @@ def _safe_error(exc: Exception) -> str:
     return f"{type(exc).__name__}: {str(exc)[:160]}"
 
 
+async def check_mcp_tools(
+    mcp_app: Any,
+    *,
+    expected_tool_names: frozenset[str] = EXPECTED_TOOL_NAMES,
+    timeout_seconds: float = 10,
+) -> dict[str, Any]:
+    """Exercise MCP initialize, tools/list and tools/call in process.
+
+    Raw provider pings do not prove that FastMCP can publish schemas, dispatch a
+    call, or serialize its result. The smoke tool uses its local help mode so the
+    platform health check does not consume provider quota every 30 seconds.
+    External provider probes remain separate below and identify upstream
+    outages alongside this MCP-level check.
+    """
+    started = time.perf_counter()
+
+    async def run_probe() -> tuple[list[Any], Any]:
+        # Import lazily: health.py remains usable by lightweight unit tests and
+        # scripts which do not otherwise need to import the MCP client stack.
+        from fastmcp import Client
+
+        async with Client(mcp_app) as client:
+            tools = await client.list_tools()
+            result = await client.call_tool(MCP_SMOKE_TOOL, MCP_SMOKE_ARGUMENTS)
+            return tools, result
+
+    try:
+        tools, result = await asyncio.wait_for(run_probe(), timeout=timeout_seconds)
+        tool_names = {tool.name for tool in tools}
+        missing = sorted(expected_tool_names - tool_names)
+        if missing:
+            raise ValueError(f"missing MCP tools: {', '.join(missing)}")
+        if result.is_error:
+            raise ValueError(f"MCP smoke tool failed: {MCP_SMOKE_TOOL}")
+
+        text_parts = [
+            item.text
+            for item in result.content
+            if getattr(item, "text", None)
+        ]
+        if not "".join(text_parts).strip():
+            raise ValueError(f"MCP smoke tool returned no text: {MCP_SMOKE_TOOL}")
+
+        return {
+            "status": "ok",
+            "latency_ms": round((time.perf_counter() - started) * 1000),
+            "protocol_checks": ["initialize", "tools/list", "tools/call"],
+            "tool_count": len(tool_names),
+            "smoke_tool": MCP_SMOKE_TOOL,
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "latency_ms": round((time.perf_counter() - started) * 1000),
+            "error": _safe_error(exc),
+        }
+
+
 async def check_dependencies(
     *,
     dependencies: list[Dependency] | None = None,
     timeout_seconds: float | None = None,
     client: httpx.AsyncClient | None = None,
+    mcp_app: Any | None = None,
 ) -> tuple[dict[str, Any], int]:
-    """Check dependencies concurrently and return the response body and HTTP status."""
+    """Check MCP readiness and dependencies, returning body and HTTP status."""
     dependencies = dependencies if dependencies is not None else configured_dependencies()
     timeout_seconds = timeout_seconds or float(os.getenv("HEALTHCHECK_TIMEOUT_SECONDS", "5"))
 
@@ -393,29 +487,37 @@ async def check_dependencies(
 
     started = time.perf_counter()
     try:
-        results = await asyncio.gather(
-            *(_probe(client, dependency, timeout_seconds) for dependency in dependencies)
-        )
+        tasks = [
+            _probe(client, dependency, timeout_seconds) for dependency in dependencies
+        ]
+        if mcp_app is not None:
+            tasks.append(check_mcp_tools(mcp_app, timeout_seconds=timeout_seconds + 5))
+        gathered = await asyncio.gather(*tasks)
     finally:
         if owns_client:
             await client.aclose()
+
+    results = gathered[: len(dependencies)]
+    mcp_result = gathered[-1] if mcp_app is not None else {
+        "status": "not_checked",
+        "reason": "No MCP application was supplied",
+    }
 
     services = {
         dependency.name: result
         for dependency, result in zip(dependencies, results, strict=True)
     }
-    checks_failed = any(result["status"] == "error" for result in results)
+    checks_failed = (
+        any(result["status"] == "error" for result in results)
+        or mcp_result["status"] == "error"
+    )
     body = {
         "status": "degraded" if checks_failed else "ok",
         "service": "Borsa MCP Server",
         "version": "1.0.0",
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "duration_ms": round((time.perf_counter() - started) * 1000),
-        "application": {
-            "python_process": "ok",
-            "asgi": "ok",
-            "http_routing": "ok",
-        },
+        "application": mcp_result,
         "services": services,
     }
     return body, 503 if checks_failed else 200
