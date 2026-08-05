@@ -25,8 +25,13 @@ class Dependency:
     headers: dict[str, str] | None = None
     required_env: str | None = None
     env_header: str | None = None
+    env_json_field: str | None = None
     timeout_seconds: float | None = None
     use_sync_client: bool = False
+
+
+class HealthRateLimited(Exception):
+    """A provider is reachable but declined a probe because its quota is spent."""
 
 
 def _validate_yahoo(response: httpx.Response) -> None:
@@ -47,7 +52,19 @@ def _validate_btcturk(response: httpx.Response) -> None:
 
 
 def _validate_bls(response: httpx.Response) -> None:
-    if response.json().get("status") != "REQUEST_SUCCEEDED":
+    payload = response.json()
+    if payload.get("status") == "REQUEST_SUCCEEDED":
+        return
+
+    message = " ".join(str(item) for item in payload.get("message", []))
+    lower_message = message.lower()
+    if "daily" in lower_message and any(
+        word in lower_message for word in ("limit", "threshold", "requests")
+    ):
+        raise HealthRateLimited(
+            "BLS anonymous daily query quota has been reached"
+        )
+    else:
         raise ValueError("BLS API returned an unsuccessful response")
 
 
@@ -213,8 +230,12 @@ DEPENDENCIES: dict[str, Dependency] = {
     ),
     "bls": Dependency(
         name="BLS",
-        url="https://api.bls.gov/publicAPI/v1/timeseries/data/CUUR0000SA0",
+        url="https://api.bls.gov/publicAPI/v2/timeseries/data/",
         validator=_validate_bls,
+        method="POST",
+        json={"seriesid": ["CUUR0000SA0"]},
+        required_env="BLS_API_KEY",
+        env_json_field="registrationkey",
     ),
     "eurostat": Dependency(
         name="Eurostat",
@@ -273,7 +294,10 @@ async def _probe(
                 headers[dependency.env_header] = secret
         request_kwargs: dict[str, Any] = {"headers": headers}
         if dependency.json is not None:
-            request_kwargs["json"] = dependency.json
+            payload = dict(dependency.json)
+            if dependency.required_env and dependency.env_json_field:
+                payload[dependency.env_json_field] = secret
+            request_kwargs["json"] = payload
         request_kwargs["timeout"] = effective_timeout
         if dependency.use_sync_client:
             # FRED's CDN is reachable from Azure Container Apps with httpx's
@@ -305,6 +329,12 @@ async def _probe(
             "status": "ok",
             "latency_ms": round((time.perf_counter() - started) * 1000),
             "http_status": response.status_code,
+        }
+    except HealthRateLimited as exc:
+        return {
+            "status": "rate_limited",
+            "latency_ms": round((time.perf_counter() - started) * 1000),
+            "reason": str(exc),
         }
     except Exception as exc:
         return {
