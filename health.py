@@ -26,6 +26,7 @@ class Dependency:
     required_env: str | None = None
     env_header: str | None = None
     timeout_seconds: float | None = None
+    use_sync_client: bool = False
 
 
 def _validate_yahoo(response: httpx.Response) -> None:
@@ -195,7 +196,9 @@ DEPENDENCIES: dict[str, Dependency] = {
         name="FRED US CPI",
         url="https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCNS",
         validator=_fred_validator("CPIAUCNS", 1913),
+        headers={"User-Agent": f"python-httpx/{httpx.__version__}"},
         timeout_seconds=15,
+        use_sync_client=True,
     ),
     "fred_eu": Dependency(
         name="FRED Euro Area HICP",
@@ -204,7 +207,9 @@ DEPENDENCIES: dict[str, Dependency] = {
             "fredgraph.csv?id=CP0000EZCCM086NEST"
         ),
         validator=_fred_validator("CP0000EZCCM086NEST", 1996),
+        headers={"User-Agent": f"python-httpx/{httpx.__version__}"},
         timeout_seconds=15,
+        use_sync_client=True,
     ),
     "bls": Dependency(
         name="BLS",
@@ -270,14 +275,29 @@ async def _probe(
         if dependency.json is not None:
             request_kwargs["json"] = dependency.json
         request_kwargs["timeout"] = effective_timeout
-        response = await asyncio.wait_for(
-            client.request(
-                dependency.method,
-                dependency.url,
-                **request_kwargs,
-            ),
-            timeout=effective_timeout,
-        )
+        if dependency.use_sync_client:
+            # FRED's CDN is reachable from Azure Container Apps with httpx's
+            # synchronous transport, while the async transport stalls until its
+            # timeout. Keep the ASGI event loop free by running that proven
+            # transport in a worker thread.
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _sync_request,
+                    dependency,
+                    request_kwargs,
+                    effective_timeout,
+                ),
+                timeout=effective_timeout + 1,
+            )
+        else:
+            response = await asyncio.wait_for(
+                client.request(
+                    dependency.method,
+                    dependency.url,
+                    **request_kwargs,
+                ),
+                timeout=effective_timeout,
+            )
         response.raise_for_status()
         if dependency.validator:
             dependency.validator(response)
@@ -292,6 +312,24 @@ async def _probe(
             "latency_ms": round((time.perf_counter() - started) * 1000),
             "error": _safe_error(exc),
         }
+
+
+def _sync_request(
+    dependency: Dependency,
+    request_kwargs: dict[str, Any],
+    timeout_seconds: float,
+) -> httpx.Response:
+    """Perform a blocking probe without blocking the caller's event loop."""
+    with httpx.Client(
+        follow_redirects=True,
+        timeout=timeout_seconds,
+        verify=False,
+    ) as client:
+        return client.request(
+            dependency.method,
+            dependency.url,
+            **request_kwargs,
+        )
 
 
 def _safe_error(exc: Exception) -> str:
