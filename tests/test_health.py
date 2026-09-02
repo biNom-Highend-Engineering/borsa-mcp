@@ -6,6 +6,7 @@ import pytest
 from health import (
     DEPENDENCIES,
     Dependency,
+    TEFAS_CANARY_FUNDS,
     check_mcp_tools,
     check_dependencies,
     configured_dependencies,
@@ -78,8 +79,12 @@ async def test_production_aligned_probes_send_expected_requests():
 
         if request.url.path == "/api/funds/fonBilgiGetir":
             assert request.method == "POST"
-            assert json.loads(request.content) == {"fonKodu": "AAK"}
-            return httpx.Response(200, json={"resultList": [{"fonKodu": "AAK"}]})
+            assert json.loads(request.content) == {
+                "fonKodu": TEFAS_CANARY_FUNDS[0]
+            }
+            return httpx.Response(
+                200, json={"resultList": [{"fonKodu": TEFAS_CANARY_FUNDS[0]}]}
+            )
 
         if request.url.path.startswith(
             "/plugins/ExcelExportTefasFundsTradingInvestmentPlatform"
@@ -227,6 +232,43 @@ async def test_health_returns_503_and_identifies_failed_dependency():
         "latency_ms": body["services"]["TCMB"]["latency_ms"],
         "error": "HTTP 503",
     }
+
+
+async def test_delisted_tefas_canary_fund_falls_back_to_the_next_one():
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        fund_code = json.loads(request.content)["fonKodu"]
+        seen.append(fund_code)
+        if fund_code == TEFAS_CANARY_FUNDS[0]:
+            return httpx.Response(200, json={"resultList": []})
+        return httpx.Response(200, json={"resultList": [{"fonKodu": fund_code}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        body, status_code = await check_dependencies(
+            dependencies=dependencies_for(["tefas"]), client=client, timeout_seconds=1
+        )
+
+    assert status_code == 200
+    assert body["services"]["TEFAS"]["status"] == "ok"
+    assert seen == list(TEFAS_CANARY_FUNDS[:2])
+
+
+async def test_tefas_fails_only_when_every_canary_fund_is_empty():
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content)["fonKodu"])
+        return httpx.Response(200, json={"resultList": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        body, status_code = await check_dependencies(
+            dependencies=dependencies_for(["tefas"]), client=client, timeout_seconds=1
+        )
+
+    assert status_code == 503
+    assert body["services"]["TEFAS"]["status"] == "error"
+    assert seen == list(TEFAS_CANARY_FUNDS)
 
 
 async def test_mcp_health_lists_contract_and_calls_a_tool():

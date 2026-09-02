@@ -18,6 +18,10 @@ ResponseValidator = Callable[[httpx.Response], None]
 MCP_SMOKE_TOOL = "scan_stocks"
 MCP_SMOKE_ARGUMENTS = {"help": True}
 
+# TEFAS delists funds, so probe several large, long-lived funds from different
+# founders and only report an error when none of them answer.
+TEFAS_CANARY_FUNDS = ("TI2", "AFA", "YAS")
+
 
 @dataclass(frozen=True)
 class Dependency:
@@ -26,6 +30,7 @@ class Dependency:
     validator: ResponseValidator | None = None
     method: str = "GET"
     json: dict[str, Any] | None = None
+    json_alternatives: tuple[dict[str, Any], ...] = ()
     headers: dict[str, str] | None = None
     required_env: str | None = None
     env_header: str | None = None
@@ -59,6 +64,18 @@ def _validate_tefas_fund(response: httpx.Response) -> None:
     payload = response.json()
     if payload.get("errorMessage") or not payload.get("resultList"):
         raise ValueError("TEFAS returned no fund data")
+
+
+def _validate_mynet_stock_list(response: httpx.Response) -> None:
+    # Mynet is scraped, so HTTP 200 is not enough. Assert the exact markup
+    # MynetProvider._fetch_ticker_urls depends on is still present.
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(response.content, "lxml")
+    for link in soup.select("table a.ft-name[href][title]"):
+        if "/borsa/hisseler/" in link["href"]:
+            return
+    raise ValueError("Mynet stock table markup changed")
 
 
 def _validate_coinbase_products(response: httpx.Response) -> None:
@@ -192,6 +209,7 @@ DEPENDENCIES: dict[str, Dependency] = {
     "mynet": Dependency(
         name="Mynet Finans",
         url="https://finans.mynet.com/borsa/hisseler/",
+        validator=_validate_mynet_stock_list,
     ),
     "is_yatirim": Dependency(
         name="Is Yatirim",
@@ -202,7 +220,10 @@ DEPENDENCIES: dict[str, Dependency] = {
         url="https://www.tefas.gov.tr/api/funds/fonBilgiGetir",
         validator=_validate_tefas_fund,
         method="POST",
-        json={"fonKodu": "AAK"},
+        json={"fonKodu": TEFAS_CANARY_FUNDS[0]},
+        json_alternatives=tuple(
+            {"fonKodu": code} for code in TEFAS_CANARY_FUNDS[1:]
+        ),
         headers={"Accept": "application/json"},
     ),
     "takasbank": Dependency(
@@ -345,26 +366,33 @@ async def _probe(
                 "reason": f"{dependency.required_env} is not configured",
             }
 
-    try:
-        effective_timeout = dependency.timeout_seconds or timeout_seconds
-        headers = {"User-Agent": "BorsaMCP-HealthCheck/1.0"}
-        headers.update(dependency.headers or {})
-        if dependency.required_env:
-            if dependency.env_header:
-                headers[dependency.env_header] = secret
-        request_kwargs: dict[str, Any] = {"headers": headers}
-        if dependency.json is not None:
-            payload = dict(dependency.json)
+    effective_timeout = dependency.timeout_seconds or timeout_seconds
+    headers = {"User-Agent": "BorsaMCP-HealthCheck/1.0"}
+    headers.update(dependency.headers or {})
+    if dependency.required_env and dependency.env_header:
+        headers[dependency.env_header] = secret
+
+    if dependency.json is None:
+        payloads: list[dict[str, Any] | None] = [None]
+    else:
+        payloads = [dependency.json, *dependency.json_alternatives]
+
+    async def attempt(payload: dict[str, Any] | None) -> httpx.Response:
+        request_kwargs: dict[str, Any] = {
+            "headers": headers,
+            "timeout": effective_timeout,
+        }
+        if payload is not None:
+            body = dict(payload)
             if dependency.required_env and dependency.env_json_field:
-                payload[dependency.env_json_field] = secret
-            request_kwargs["json"] = payload
-        request_kwargs["timeout"] = effective_timeout
+                body[dependency.env_json_field] = secret
+            request_kwargs["json"] = body
         if dependency.use_sync_client:
             # FRED's CDN is reachable from Azure Container Apps with httpx's
             # synchronous transport, while the async transport stalls until its
             # timeout. Keep the ASGI event loop free by running that proven
             # transport in a worker thread.
-            response = await asyncio.wait_for(
+            return await asyncio.wait_for(
                 asyncio.to_thread(
                     _sync_request,
                     dependency,
@@ -373,35 +401,38 @@ async def _probe(
                 ),
                 timeout=effective_timeout + 1,
             )
-        else:
-            response = await asyncio.wait_for(
-                client.request(
-                    dependency.method,
-                    dependency.url,
-                    **request_kwargs,
-                ),
-                timeout=effective_timeout,
-            )
-        response.raise_for_status()
-        if dependency.validator:
-            dependency.validator(response)
-        return {
-            "status": "ok",
-            "latency_ms": round((time.perf_counter() - started) * 1000),
-            "http_status": response.status_code,
-        }
-    except HealthRateLimited as exc:
-        return {
-            "status": "rate_limited",
-            "latency_ms": round((time.perf_counter() - started) * 1000),
-            "reason": str(exc),
-        }
-    except Exception as exc:
-        return {
-            "status": "error",
-            "latency_ms": round((time.perf_counter() - started) * 1000),
-            "error": _safe_error(exc),
-        }
+        return await asyncio.wait_for(
+            client.request(dependency.method, dependency.url, **request_kwargs),
+            timeout=effective_timeout,
+        )
+
+    last_error: Exception | None = None
+    for payload in payloads:
+        try:
+            response = await attempt(payload)
+            response.raise_for_status()
+            if dependency.validator:
+                dependency.validator(response)
+            return {
+                "status": "ok",
+                "latency_ms": round((time.perf_counter() - started) * 1000),
+                "http_status": response.status_code,
+            }
+        except HealthRateLimited as exc:
+            return {
+                "status": "rate_limited",
+                "latency_ms": round((time.perf_counter() - started) * 1000),
+                "reason": str(exc),
+            }
+        except Exception as exc:
+            last_error = exc
+
+    assert last_error is not None
+    return {
+        "status": "error",
+        "latency_ms": round((time.perf_counter() - started) * 1000),
+        "error": _safe_error(last_error),
+    }
 
 
 def _sync_request(

@@ -36,18 +36,16 @@ class MynetProvider:
             response = await self._http_client.get(self.BASE_URL)
             response.raise_for_status()
             soup = BeautifulSoup(response.content, 'lxml')
-            table_body = soup.select_one("div.scrollable-box-hisseler tbody.tbody-type-default")
-            if not table_body:
-                return None
             url_map = {}
-            for row in table_body.find_all("tr"):
-                link_tag = row.select_one("td > strong > a")
-                if link_tag and link_tag.has_attr('href') and link_tag.has_attr('title'):
-                    title_attr = link_tag['title']
-                    if title_attr and title_attr.split():
-                        ticker = title_attr.split()[0]
-                        url_map[ticker.upper()] = link_tag['href']
-            return url_map
+            for link_tag in soup.select("table a.ft-name[href][title]"):
+                href = link_tag['href']
+                if '/borsa/hisseler/' not in href:
+                    continue
+                title_attr = link_tag['title']
+                if title_attr and title_attr.split():
+                    ticker = title_attr.split()[0]
+                    url_map[ticker.upper()] = href
+            return url_map or None
         except Exception:
             logger.exception("Error in MynetProvider._fetch_ticker_urls")
             return None
