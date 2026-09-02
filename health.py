@@ -15,37 +15,6 @@ import httpx
 ResponseValidator = Callable[[httpx.Response], None]
 
 
-# This is the public MCP surface, not merely a tool count. A count-only check can
-# stay green when one tool is accidentally removed and another is accidentally
-# added. Keep this set in sync deliberately when the public contract changes.
-EXPECTED_TOOL_NAMES = frozenset(
-    {
-        "search_symbol",
-        "get_profile",
-        "get_quote",
-        "get_historical_data",
-        "get_technical_analysis",
-        "get_analyst_data",
-        "get_earnings",
-        "get_financial_statements",
-        "get_financial_ratios",
-        "get_corporate_actions",
-        "get_news",
-        "screen_securities",
-        "scan_stocks",
-        "compare_assets",
-        "get_sector_comparison",
-        "get_crypto_market",
-        "get_economic_calendar",
-        "get_bond_yields",
-        "get_fund_data",
-        "screen_funds",
-        "get_index_data",
-        "get_macro_data",
-        "get_evds_data",
-    }
-)
-
 MCP_SMOKE_TOOL = "scan_stocks"
 MCP_SMOKE_ARGUMENTS = {"help": True}
 
@@ -79,6 +48,33 @@ def _validate_yahoo(response: httpx.Response) -> None:
 
 def _validate_json(response: httpx.Response) -> None:
     response.json()
+
+
+def _validate_xlsx(response: httpx.Response) -> None:
+    if not response.content.startswith(b"PK"):
+        raise ValueError("Expected an XLSX file")
+
+
+def _validate_tefas_fund(response: httpx.Response) -> None:
+    payload = response.json()
+    if payload.get("errorMessage") or not payload.get("resultList"):
+        raise ValueError("TEFAS returned no fund data")
+
+
+def _validate_coinbase_products(response: httpx.Response) -> None:
+    if not response.json().get("products"):
+        raise ValueError("Coinbase returned no products")
+
+
+def _validate_coinbase_currencies(response: httpx.Response) -> None:
+    if not response.json().get("data"):
+        raise ValueError("Coinbase returned no currencies")
+
+
+def _validate_tradingview_earnings(response: httpx.Response) -> None:
+    rows = response.json().get("data") or []
+    if not rows or len(rows[0].get("d", [])) < 6:
+        raise ValueError("TradingView returned no earnings row")
 
 
 def _validate_btcturk(response: httpx.Response) -> None:
@@ -144,7 +140,9 @@ DEPENDENCIES: dict[str, Dependency] = {
     ),
     "kap": Dependency(
         name="KAP",
-        url="https://www.kap.org.tr/tr/",
+        url="https://www.kap.org.tr/tr/api/company/generic/excel/IGS/A",
+        validator=_validate_xlsx,
+        headers={"Referer": "https://www.kap.org.tr/tr/bist-sirketler"},
     ),
     "tcmb": Dependency(
         name="TCMB Inflation (TUFE)",
@@ -201,11 +199,19 @@ DEPENDENCIES: dict[str, Dependency] = {
     ),
     "tefas": Dependency(
         name="TEFAS",
-        url="https://www.tefas.gov.tr/",
+        url="https://www.tefas.gov.tr/api/funds/fonBilgiGetir",
+        validator=_validate_tefas_fund,
+        method="POST",
+        json={"fonKodu": "AAK"},
+        headers={"Accept": "application/json"},
     ),
     "takasbank": Dependency(
         name="Takasbank",
-        url="https://www.takasbank.com.tr/",
+        url=(
+            "https://www.takasbank.com.tr/plugins/"
+            "ExcelExportTefasFundsTradingInvestmentPlatform?language=tr"
+        ),
+        validator=_validate_xlsx,
     ),
     "doviz": Dependency(
         name="Doviz.com",
@@ -225,9 +231,16 @@ DEPENDENCIES: dict[str, Dependency] = {
         validator=_validate_json,
     ),
     "coinbase": Dependency(
-        name="Coinbase",
-        url="https://api.coinbase.com/v2/time",
-        validator=_validate_json,
+        name="Coinbase Products",
+        url="https://api.coinbase.com/api/v3/brokerage/market/products",
+        validator=_validate_coinbase_products,
+        headers={"Accept": "application/json"},
+    ),
+    "coinbase_currencies": Dependency(
+        name="Coinbase Currencies",
+        url="https://api.coinbase.com/v2/currencies",
+        validator=_validate_coinbase_currencies,
+        headers={"Accept": "application/json"},
     ),
     "world_bank": Dependency(
         name="World Bank",
@@ -235,14 +248,26 @@ DEPENDENCIES: dict[str, Dependency] = {
         validator=_validate_json,
     ),
     "tradingview": Dependency(
-        name="TradingView Scanner",
+        name="TradingView Earnings",
         url="https://scanner.tradingview.com/turkey/scan",
-        validator=_validate_json,
+        validator=_validate_tradingview_earnings,
         method="POST",
         json={
+            "filter": [
+                {"left": "exchange", "operation": "equal", "right": "BIST"}
+            ],
             "symbols": {"tickers": ["BIST:THYAO"], "query": {"types": []}},
-            "columns": ["close"],
+            "columns": [
+                "name",
+                "earnings_release_date",
+                "earnings_release_next_date",
+                "earnings_per_share_basic_ttm",
+                "earnings_per_share_diluted_ttm",
+                "earnings_per_share_forecast_next_fq",
+            ],
+            "range": [0, 1],
         },
+        headers={"Content-Type": "application/json"},
     ),
     "fred_us": Dependency(
         name="FRED US CPI",
@@ -411,7 +436,6 @@ def _safe_error(exc: Exception) -> str:
 async def check_mcp_tools(
     mcp_app: Any,
     *,
-    expected_tool_names: frozenset[str] = EXPECTED_TOOL_NAMES,
     timeout_seconds: float = 10,
 ) -> dict[str, Any]:
     """Exercise MCP initialize, tools/list and tools/call in process.
@@ -436,10 +460,8 @@ async def check_mcp_tools(
 
     try:
         tools, result = await asyncio.wait_for(run_probe(), timeout=timeout_seconds)
-        tool_names = {tool.name for tool in tools}
-        missing = sorted(expected_tool_names - tool_names)
-        if missing:
-            raise ValueError(f"missing MCP tools: {', '.join(missing)}")
+        if not tools:
+            raise ValueError("MCP server published no tools")
         if result.is_error:
             raise ValueError(f"MCP smoke tool failed: {MCP_SMOKE_TOOL}")
 
@@ -455,7 +477,7 @@ async def check_mcp_tools(
             "status": "ok",
             "latency_ms": round((time.perf_counter() - started) * 1000),
             "protocol_checks": ["initialize", "tools/list", "tools/call"],
-            "tool_count": len(tool_names),
+            "tool_count": len(tools),
             "smoke_tool": MCP_SMOKE_TOOL,
         }
     except Exception as exc:

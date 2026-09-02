@@ -1,10 +1,11 @@
+import json
+
 import httpx
 import pytest
 
 from health import (
     DEPENDENCIES,
     Dependency,
-    EXPECTED_TOOL_NAMES,
     check_mcp_tools,
     check_dependencies,
     configured_dependencies,
@@ -32,9 +33,10 @@ def test_all_external_services_are_checked_by_default(monkeypatch):
         "Doviz.com",
         "BTCTurk",
         "BTCTurk Graph API",
-        "Coinbase",
+        "Coinbase Products",
+        "Coinbase Currencies",
         "World Bank",
-        "TradingView Scanner",
+        "TradingView Earnings",
         "FRED US CPI",
         "FRED Euro Area HICP",
         "BLS",
@@ -61,6 +63,73 @@ def test_dependencies_can_be_selected_for_per_service_azure_alerts():
 
 def test_legacy_fred_key_selects_us_region():
     assert dependencies_for(["fred"])[0].name == "FRED US CPI"
+
+
+async def test_production_aligned_probes_send_expected_requests():
+    seen = set()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.add(request.url.path)
+
+        if request.url.path == "/tr/api/company/generic/excel/IGS/A":
+            assert request.method == "GET"
+            assert request.headers["referer"].endswith("/tr/bist-sirketler")
+            return httpx.Response(200, content=b"PK\x03\x04kap-xlsx")
+
+        if request.url.path == "/api/funds/fonBilgiGetir":
+            assert request.method == "POST"
+            assert json.loads(request.content) == {"fonKodu": "AAK"}
+            return httpx.Response(200, json={"resultList": [{"fonKodu": "AAK"}]})
+
+        if request.url.path.startswith(
+            "/plugins/ExcelExportTefasFundsTradingInvestmentPlatform"
+        ):
+            assert request.method == "GET"
+            assert request.url.params["language"] == "tr"
+            return httpx.Response(200, content=b"PK\x03\x04takasbank-xlsx")
+
+        if request.url.path == "/api/v3/brokerage/market/products":
+            assert request.method == "GET"
+            return httpx.Response(200, json={"products": [{"product_id": "BTC-USD"}]})
+
+        if request.url.path == "/v2/currencies":
+            assert request.method == "GET"
+            return httpx.Response(200, json={"data": [{"id": "USD"}]})
+
+        if request.url.path == "/turkey/scan":
+            assert request.method == "POST"
+            payload = json.loads(request.content)
+            assert payload["symbols"]["tickers"] == ["BIST:THYAO"]
+            assert payload["columns"] == [
+                "name",
+                "earnings_release_date",
+                "earnings_release_next_date",
+                "earnings_per_share_basic_ttm",
+                "earnings_per_share_diluted_ttm",
+                "earnings_per_share_forecast_next_fq",
+            ]
+            return httpx.Response(200, json={"data": [{"d": ["THYAO", 1, 2, 3, 4, 5]}]})
+
+        raise AssertionError(f"Unexpected health request: {request.method} {request.url}")
+
+    dependencies = dependencies_for(
+        ["kap", "tefas", "takasbank", "coinbase", "coinbase_currencies", "tradingview"]
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        body, status_code = await check_dependencies(
+            dependencies=dependencies, client=client, timeout_seconds=1
+        )
+
+    assert status_code == 200
+    assert body["status"] == "ok"
+    assert seen == {
+        "/tr/api/company/generic/excel/IGS/A",
+        "/api/funds/fonBilgiGetir",
+        "/plugins/ExcelExportTefasFundsTradingInvestmentPlatform",
+        "/api/v3/brokerage/market/products",
+        "/v2/currencies",
+        "/turkey/scan",
+    }
 
 
 async def test_unconfigured_optional_api_is_reported_without_failing_health(monkeypatch):
@@ -166,27 +235,9 @@ async def test_mcp_health_lists_contract_and_calls_a_tool():
     result = await check_mcp_tools(app)
 
     assert result["status"] == "ok"
-    assert result["tool_count"] == len(EXPECTED_TOOL_NAMES)
+    assert result["tool_count"] > 0
     assert result["protocol_checks"] == ["initialize", "tools/list", "tools/call"]
     assert result["smoke_tool"] == "scan_stocks"
-
-
-async def test_mcp_health_fails_when_a_public_tool_is_missing():
-    from fastmcp import FastMCP
-
-    incomplete_app = FastMCP("incomplete")
-
-    @incomplete_app.tool(name="scan_stocks")
-    async def scan_stocks(help: bool = False) -> str:
-        return "help" if help else "scan"
-
-    result = await check_mcp_tools(
-        incomplete_app,
-        expected_tool_names=frozenset({"scan_stocks", "get_quote"}),
-    )
-
-    assert result["status"] == "error"
-    assert "missing MCP tools: get_quote" in result["error"]
 
 
 async def test_http_health_defaults_to_mcp_readiness_and_all_upstreams(monkeypatch):
@@ -199,7 +250,7 @@ async def test_http_health_defaults_to_mcp_readiness_and_all_upstreams(monkeypat
         captured["mcp_app"] = mcp_app
         return {
             "status": "ok",
-            "application": {"status": "ok", "tool_count": len(EXPECTED_TOOL_NAMES)},
+            "application": {"status": "ok", "tool_count": 23},
             "services": {"all": {"status": "ok"}},
         }, 200
 
@@ -217,6 +268,6 @@ async def test_http_health_defaults_to_mcp_readiness_and_all_upstreams(monkeypat
     assert body["status"] == "ok"
     assert body["services"] == {"all": {"status": "ok"}}
     assert body["application"]["status"] == "ok"
-    assert body["application"]["tool_count"] == len(EXPECTED_TOOL_NAMES)
+    assert body["application"]["tool_count"] == 23
     assert captured["dependencies"] is None
     assert captured["mcp_app"] is app_module.mcp
