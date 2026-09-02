@@ -14,6 +14,7 @@ import asyncio
 import csv
 import io
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import date
@@ -119,6 +120,7 @@ def validate_series(
 
 
 BLS_URL = "https://api.bls.gov/publicAPI/v1/timeseries/data/CUUR0000SA0"
+BLS_V2_URL = "https://api.bls.gov/publicAPI/v2/timeseries/data/"
 EUROSTAT_URL = (
     "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/"
     "prc_hicp_midx?format=JSON&geo=EA&coicop=CP00&unit=I15"
@@ -268,7 +270,17 @@ class FredCpiProvider:
     async def _fetch_fallback(self, region: str) -> Optional[IndexSeries]:
         label, url = FALLBACK_SOURCES[region]
         try:
-            response = await self._client.get(url)
+            registration_key = os.getenv("BLS_API_KEY", "").strip()
+            if region == "us" and registration_key:
+                response = await self._client.post(
+                    BLS_V2_URL,
+                    json={
+                        "seriesid": ["CUUR0000SA0"],
+                        "registrationkey": registration_key,
+                    },
+                )
+            else:
+                response = await self._client.get(url)
             response.raise_for_status()
             payload = response.json()
             values = (
