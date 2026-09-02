@@ -1,5 +1,8 @@
-fastmcp>=2.14.0
-pydantic
+# Pinned: newer mcp releases turn JSONRPCMessage into a union type, which breaks
+# unified_mcp_server.py's model_rebuild() call at import time.
+fastmcp==2.14.4
+mcp==1.26.0
+pydantic==2.12.5
 httpx
 pdfplumber
 beautifulsoup4

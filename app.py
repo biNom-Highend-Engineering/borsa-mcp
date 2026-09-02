@@ -38,6 +38,12 @@ async def health_check(request):
     )
     return JSONResponse(body, status_code=status_code)
 
+
+@mcp.custom_route("/health/live", methods=["GET"])
+async def liveness(request):
+    """Liveness only - no upstream checks, so it never reports someone else's outage."""
+    return JSONResponse({"status": "ok", "service": "Borsa MCP Server"})
+
 # Create ASGI app directly from FastMCP server
 # This avoids routing issues with nested mounts
 app = mcp.http_app()
@@ -47,4 +53,5 @@ app = mcp.http_app()
 # - /health - MCP readiness plus every registered upstream check
 # - /health?service=yahoo_finance,tcmb - readiness plus selected upstream checks
 # - /health?service=all - readiness plus every registered upstream check
+# - /health/live - liveness only, never touches an upstream
 # Run with: uvicorn app:app --host 0.0.0.0 --port 8000
