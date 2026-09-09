@@ -8,6 +8,8 @@ The MCP server will be available at:
     http://localhost:8000/mcp/
 """
 
+import os
+
 from starlette.responses import JSONResponse
 from health import check_dependencies, dependencies_for
 from unified_mcp_server import app as mcp
@@ -16,6 +18,14 @@ from unified_mcp_server import app as mcp
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     """Health check endpoint for Dokploy and other monitoring services"""
+    # Experiment: /health is already excluded from Easy Auth (Application
+    # Insights can't do the OAuth handshake), so this is a second, app-level
+    # gate layered on top of that exclusion -- a static shared secret rather
+    # than a real credential, matching mevzuat-mcp/yargi-mcp's own trial.
+    health_endpoint_secret = os.getenv("HEALTH_ENDPOINT_SECRET")
+    if health_endpoint_secret and request.headers.get("X-Health-Check-Token") != health_endpoint_secret:
+        return JSONResponse({"detail": "Not Found"}, status_code=404)
+
     requested_services = request.query_params.get("service")
     try:
         if not requested_services:
