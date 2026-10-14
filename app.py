@@ -39,8 +39,16 @@ async def health_check(request):
     return JSONResponse(body, status_code=status_code)
 
 # Create ASGI app directly from FastMCP server
-# This avoids routing issues with nested mounts
-app = mcp.http_app()
+# This avoids routing issues with nested mounts.
+#
+# stateless_http=True: every request is self-contained; no per-client transport
+# object is kept server-side. The stateful default keeps a transport (task group,
+# memory streams, buffers) per `initialize` until the client sends DELETE /mcp —
+# which claude.ai and most clients never do. Measured on the live container:
+# ~11.5k sessions opened / ~750 closed per day, ~1-1.3 GB/day growth, and two
+# OOM-kills at 10.8 GB RSS (2026-08-27, 2026-09-07). Nothing here needs a session:
+# no progress, sampling, subscriptions or elicitation — plain request/response tools.
+app = mcp.http_app(stateless_http=True)
 
 # Endpoints:
 # - /mcp/ - MCP server (Streamable HTTP transport, default FastMCP path)

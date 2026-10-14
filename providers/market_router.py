@@ -6,14 +6,20 @@ Uses BorsaApiClient as the underlying service layer.
 NOTE: This module returns raw dicts, not Pydantic models, to avoid validation overhead.
 """
 import asyncio
+import ipaddress
+import socket
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
 import logging
 
 from borsapy.exceptions import DataNotAvailableError
 
 from models.unified_base import (
     MarketType, StatementType, PeriodType, DataType, RatioSetType, ExchangeType
+)
+from providers.volume_sanitizer import (
+    NO_VOLUME_WARNING, sanitize_series_volume, sanitize_volume
 )
 
 logger = logging.getLogger(__name__)
@@ -22,6 +28,42 @@ logger = logging.getLogger(__name__)
 # whatever the granularity. Verified live: 350 -> OK, 351 -> HTTP 400
 # ("number of candles requested should be less than 350").
 COINBASE_MAX_CANDLES = 350
+
+# `get_news` documents `news_id` as accepting a URL, and that URL is handed
+# straight to `httpx.get()`. Without an allow-list the tool is a blind SSRF
+# primitive: any http(s) host (cloud metadata, internal services, localhost) can
+# be fetched server-side. Keep detail URLs on the two legitimate hosts.
+ALLOWED_NEWS_HOSTS = frozenset({
+    "finans.mynet.com", "mynet.com", "kap.org.tr", "www.kap.org.tr",
+})
+
+
+async def validate_news_url(url: str) -> str:
+    """Reject news-detail URLs that leave the KAP/Mynet allow-list.
+
+    Also blocks hosts that resolve into private/loopback/link-local ranges so a
+    future allow-list entry cannot be pointed at internal infrastructure.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"news_id URL scheme not allowed: {parsed.scheme!r}")
+
+    host = (parsed.hostname or "").lower()
+    if host not in ALLOWED_NEWS_HOSTS:
+        raise ValueError(f"news_id host not allowed: {host!r}")
+
+    try:
+        infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"news_id host did not resolve: {host!r}") from exc
+
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            raise ValueError(f"news_id host resolves to a blocked address: {ip}")
+
+    return url
 
 
 def parse_tcmb_number(value: Optional[str]) -> Optional[float]:
@@ -548,7 +590,7 @@ class MarketRouter:
                         "high": dp.get("en_yuksek") or 0.0,
                         "low": dp.get("en_dusuk") or 0.0,
                         "close": dp.get("kapanis") or 0.0,
-                        "volume": int(dp.get("hacim") or 0),
+                        "volume": sanitize_volume(dp.get("hacim")),
                         "adj_close": None
                     })
 
@@ -681,6 +723,11 @@ class MarketRouter:
         if start_date or end_date:
             data_points = self._clamp_to_window(data_points, start_date, end_date)
 
+        # A feed that publishes no volume for a symbol says so by omission, and
+        # borsapy fills the gap with 0.0. Forwarding that turned TradingView's silence
+        # about XHOLD into "nothing traded in the holding sector for a month" (#14).
+        volume_published = sanitize_series_volume(data_points)
+
         if not data_points:
             # An empty-but-successful payload tells the model "this asset exists and
             # has no history here", which is a far stronger claim than "the fetch
@@ -706,18 +753,28 @@ class MarketRouter:
             "data_points": len(data_points)
         }
 
+        warnings: List[str] = []
+
         # Ranges longer than a month are resampled to weekly/monthly bars to bound
         # response size. Without saying so, rows spaced 7 or 30 days apart look like
         # daily candles with gaps, and any indicator computed off them is wrong.
         if raw_count and len(data_points) < raw_count:
             bar_interval = self._infer_bar_interval(data_points)
             result_dict["bar_interval"] = bar_interval
-            result_dict["warnings"] = [
+            warnings.append(
                 f"Resampled from {raw_count} daily bars to {len(data_points)} "
                 f"{bar_interval} bars to bound response size. These are NOT daily "
                 f"candles. For daily bars, request a period of 1mo or shorter, or pass "
                 f"an explicit start_date/end_date range."
-            ]
+            )
+
+        # Only for markets that have a volume series at all — FX and funds legitimately
+        # have none, and already say so in their own words.
+        if not volume_published and market not in (MarketType.FX, MarketType.FUND):
+            warnings.append(NO_VOLUME_WARNING)
+
+        if warnings:
+            result_dict["warnings"] = warnings
 
         return result_dict
 
@@ -2792,6 +2849,7 @@ class MarketRouter:
         source = "unknown"
         index_info = None
         components = []
+        warnings: List[str] = []
 
         if market == MarketType.BIST:
             # borsapy is the only source here that carries the index *level*. KAP's
@@ -2822,8 +2880,12 @@ class MarketRouter:
                 "high": info.get("high"),
                 "low": info.get("low"),
                 "previous_close": info.get("prev_close"),
-                "volume": info.get("volume"),
+                # 1e100 is TradingView's "no data", not a volume. It used to be
+                # rendered in full: a 101-digit integer where XHOLD's turnover belongs.
+                "volume": sanitize_volume(info.get("volume")),
             }
+            if index_info["volume"] is None:
+                warnings.append(NO_VOLUME_WARNING)
 
             if include_components:
                 symbols = await loop.run_in_executor(None, lambda: index_obj.component_symbols)
@@ -2861,11 +2923,14 @@ class MarketRouter:
                     "components_count": idx.get("components_count")
                 }
 
-        return {
+        result = {
             "metadata": self._create_metadata(market, code, source),
             "index": index_info,
             "components": components
         }
+        if warnings:
+            result["warnings"] = warnings
+        return result
 
     # --- Sector Comparison ---
 
@@ -3045,7 +3110,7 @@ class MarketRouter:
         source = "mynet"
 
         if news_id.startswith("http"):
-            news_url = news_id
+            news_url = await validate_news_url(news_id)
         else:
             news_url = f"https://finans.mynet.com/borsa/haberdetay/{news_id}/"
 
