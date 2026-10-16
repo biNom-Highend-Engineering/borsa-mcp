@@ -313,3 +313,22 @@ async def test_http_health_defaults_to_mcp_readiness_and_all_upstreams(monkeypat
     assert body["application"]["tool_count"] == 23
     assert captured["dependencies"] is None
     assert captured["mcp_app"] is app_module.mcp
+
+
+async def test_http_liveness_answers_200_without_checking_any_upstream(monkeypatch):
+    import app as app_module
+
+    async def fail_if_called(**_kwargs):
+        raise AssertionError("/health/live must not check upstreams")
+
+    monkeypatch.setattr(app_module, "check_dependencies", fail_if_called)
+
+    transport = httpx.ASGITransport(app=app_module.app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://health.test",
+    ) as client:
+        response = await client.get("/health/live")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "service": "Borsa MCP Server"}
