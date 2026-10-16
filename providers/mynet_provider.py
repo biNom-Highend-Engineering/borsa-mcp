@@ -36,15 +36,27 @@ class MynetProvider:
             response = await self._http_client.get(self.BASE_URL)
             response.raise_for_status()
             soup = BeautifulSoup(response.content, 'lxml')
+            # Mynet renamed the wrapper (scrollable-box-hisseler -> scrollable-box-finans) and
+            # dropped the <strong> around the link (Sept 2026). Match the table body directly
+            # and accept both link shapes so the old markup keeps working too.
+            table_body = (
+                soup.select_one("div.scrollable-box-hisseler tbody.tbody-type-default")
+                or soup.select_one("table.finans-data-table tbody.tbody-type-default")
+                or soup.select_one("tbody.tbody-type-default")
+            )
+            if not table_body:
+                return None
             url_map = {}
-            for link_tag in soup.select("table a.ft-name[href][title]"):
-                href = link_tag['href']
-                if '/borsa/hisseler/' not in href:
-                    continue
-                title_attr = link_tag['title']
-                if title_attr and title_attr.split():
-                    ticker = title_attr.split()[0]
-                    url_map[ticker.upper()] = href
+            for row in table_body.find_all("tr"):
+                link_tag = row.select_one("td > strong > a") or row.select_one("td > a.ft-name")
+                if link_tag and link_tag.has_attr('href') and link_tag.has_attr('title'):
+                    href = link_tag['href']
+                    if '/borsa/hisseler/' not in href:
+                        continue
+                    title_attr = link_tag['title']
+                    if title_attr and title_attr.split():
+                        ticker = title_attr.split()[0]
+                        url_map[ticker.upper()] = href
             return url_map or None
         except Exception:
             logger.exception("Error in MynetProvider._fetch_ticker_urls")
