@@ -26,7 +26,7 @@ class BuffettAnalyzerProvider:
         Initialize the Buffett Analyzer Provider.
 
         Args:
-            tahvil_provider: DovizcomTahvilProvider instance for bond yields
+            tahvil_provider: BorsapyBondProvider instance for bond yields
             tcmb_provider: TcmbProvider instance for inflation data
             worldbank_provider: WorldBankProvider instance for GDP growth
             yfinance_provider: YahooFinanceProvider instance for analyst data
