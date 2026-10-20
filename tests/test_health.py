@@ -683,7 +683,38 @@ async def test_doviz_api_probe_fails_when_no_price_comes_back(monkeypatch):
 def test_bond_probe_fails_when_doviz_returns_no_yields(monkeypatch):
     import health
 
-    monkeypatch.setattr(health.DovizcomTahvilProvider, "get_bond_yields", lambda self: [])
+    monkeypatch.setattr(health.DovizcomBondsPageProvider, "get_bond_yields", lambda self: [])
 
     with pytest.raises(ValueError, match="no bond yields"):
+        health._probe_doviz_bonds()
+
+
+def _serve_tahvil_page(monkeypatch, html):
+    import health
+
+    monkeypatch.setattr(
+        health.DovizcomBondsPageProvider,
+        "_get",
+        lambda self, url, **kw: httpx.Response(
+            200, content=html.encode("utf-8"), request=httpx.Request("GET", url)
+        ),
+    )
+
+
+def test_bond_probe_parses_the_markup_the_tool_parses(monkeypatch):
+    import health
+    from test_bond_yields import BONDS_PAGE
+
+    _serve_tahvil_page(monkeypatch, BONDS_PAGE)
+
+    health._probe_doviz_bonds()
+
+
+def test_bond_probe_fails_when_the_bond_table_markup_changes(monkeypatch):
+    import health
+    from borsapy.exceptions import DataNotAvailableError
+
+    _serve_tahvil_page(monkeypatch, "<html><table id='commodities-v2'></table></html>")
+
+    with pytest.raises(DataNotAvailableError, match="markup changed"):
         health._probe_doviz_bonds()
