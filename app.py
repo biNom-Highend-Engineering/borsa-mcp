@@ -28,14 +28,17 @@ async def health_check(request):
 
     requested_services = request.query_params.get("service")
     try:
-        if not requested_services:
-            # The default readiness check covers both the MCP tool surface and
-            # every registered external service used by those tools.
+        if not requested_services or requested_services.strip().lower() == "all":
+            # The default readiness check covers the MCP tool surface and every
+            # registered external service, but only fails when a tool has lost
+            # every source it can use: an outage a fallback covers is reported
+            # as "degraded" with HTTP 200 so it does not page anyone.
             dependencies = None
-        elif requested_services.strip().lower() == "all":
-            dependencies = None
+            tool_aware = True
         else:
+            # Explicitly selected services fail on their own, for per-service alerts.
             dependencies = dependencies_for(requested_services.split(","))
+            tool_aware = False
     except ValueError as exc:
         return JSONResponse(
             {"status": "error", "message": str(exc)},
@@ -45,6 +48,7 @@ async def health_check(request):
     body, status_code = await check_dependencies(
         dependencies=dependencies,
         mcp_app=mcp,
+        tool_aware=tool_aware,
     )
     return JSONResponse(body, status_code=status_code)
 
@@ -68,8 +72,10 @@ app = mcp.http_app(stateless_http=True)
 
 # Endpoints:
 # - /mcp/ - MCP server (Streamable HTTP transport, default FastMCP path)
-# - /health - MCP readiness plus every registered upstream check
-# - /health?service=yahoo_finance,tcmb - readiness plus selected upstream checks
-# - /health?service=all - readiness plus every registered upstream check
+# - /health - MCP readiness plus every upstream, rolled up per tool; 503 only
+#   when a tool branch has no working source (fallbacks count)
+# - /health?service=yahoo_finance,tcmb - readiness plus selected upstream checks;
+#   503 when any selected service fails
+# - /health?service=all - same as /health
 # - /health/live - liveness only, never touches an upstream
 # Run with: uvicorn app:app --host 0.0.0.0 --port 8000
