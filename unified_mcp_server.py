@@ -1360,7 +1360,18 @@ async def get_bond_yields(
             if result.get("tahvil_lookup"):
                 risk_free = result["tahvil_lookup"].get("10Y")
 
-        return shape({
+        # An empty success reads as "no bonds exist"; it is always a source failure.
+        if not yields:
+            reason = (result or {}).get("error") or "; ".join((result or {}).get("uyarilar") or []) \
+                or "no yields parsed"
+            raise ToolError(
+                f"Bond yields fetch failed: doviz.com/tahvil returned no Turkish bond "
+                f"yields ({reason}) | Try: retry once later; if it persists the page "
+                "markup has likely changed. Do not report yields as zero or unavailable "
+                "for the market."
+            )
+
+        payload = {
             "metadata": {
                 "market": "fx",
                 "symbols": ["bonds"],
@@ -1370,7 +1381,12 @@ async def get_bond_yields(
             "country": country,
             "yields": yields,
             "risk_free_rate": risk_free
-        })
+        }
+        if result.get("uyarilar"):
+            payload["warnings"] = result["uyarilar"]
+        return shape(payload)
+    except ToolError:
+        raise
     except Exception as e:
         logger.exception("Error in get_bond_yields")
         raise classify_tool_error(e, "Bond yields fetch") from e

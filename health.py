@@ -19,9 +19,12 @@ import httpx
 # in parallel, and concurrent first imports of borsapy modules can deadlock on
 # Python's import lock.
 from borsapy._providers.dovizcom_calendar import DovizcomCalendarProvider
-from borsapy._providers.dovizcom_tahvil import DovizcomTahvilProvider
 from borsapy._providers.tradingview import get_tradingview_provider
 from borsapy.cache import Cache
+
+# The bond tool parses doviz.com/tahvil with this, not with borsapy's own
+# DovizcomTahvilProvider (whose parser is out of date); probe the same code.
+from providers.borsapy_bond_provider import DovizcomBondsPageProvider
 
 
 ResponseValidator = Callable[[httpx.Response], None]
@@ -268,7 +271,7 @@ def _probe_doviz_calendar_api() -> None:
 
 
 def _probe_doviz_bonds() -> None:
-    provider = _fresh_borsapy(DovizcomTahvilProvider)
+    provider = _fresh_borsapy(DovizcomBondsPageProvider)
     try:
         if not provider.get_bond_yields():
             raise ValueError("doviz.com returned no bond yields")
