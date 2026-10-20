@@ -53,6 +53,12 @@ class DovizcomProvider:
         "gasoline": "gasoline",  # Gasoline TRY
         "lpg": "lpg"  # LPG TRY
     }
+
+    # Our asset code -> doviz.com's asset key, where they differ. doviz.com renamed
+    # WTI to XTI-USD (the /emtia/abd-ham-petrol page's assetKey); /assets/WTI/* is 404.
+    API_ASSET_KEYS = {
+        "WTI": "XTI-USD",
+    }
     
     def __init__(self, client: httpx.AsyncClient):
         self._http_client = client
@@ -60,6 +66,10 @@ class DovizcomProvider:
         self._last_fetch_times: Dict[str, float] = {}
         self._auth_manager = DovizcomAuthManager(client)
     
+    def _api_key(self, asset: str) -> str:
+        """doviz.com's key for one of our asset codes."""
+        return self.API_ASSET_KEYS.get(asset, asset)
+
     async def _get_request_headers(self, asset: str) -> Dict[str, str]:
         """Get appropriate headers for the asset request."""
         # Different origins for different asset types
@@ -71,7 +81,7 @@ class DovizcomProvider:
             referer = "https://www.doviz.com/"
         
         # Get dynamic token
-        token = await self._auth_manager.get_valid_token('assets')
+        token = await self._auth_manager.get_valid_token()
         
         return {
             'Accept': '*/*',
@@ -101,7 +111,8 @@ class DovizcomProvider:
             if response.status_code == 401 and retry_on_401:
                 logger.warning(f"Received 401 for {endpoint}, refreshing token and retrying")
                 # Get fresh token
-                token = await self._auth_manager.refresh_token_on_401('assets')
+                rejected = headers['Authorization'].removeprefix('Bearer ')
+                token = await self._auth_manager.refresh_token_on_401(rejected)
                 headers['Authorization'] = f'Bearer {token}'
                 
                 # Retry the request
@@ -119,7 +130,9 @@ class DovizcomProvider:
             
         except httpx.HTTPStatusError as e:
             logger.error(f"HTTP error for {endpoint}: {e}")
-            raise Exception(f"HTTP {e.response.status_code}: {e.response.text}") from e
+            raise Exception(
+                f"doviz.com API returned HTTP {e.response.status_code} for {endpoint}: {e.response.text}"
+            ) from e
         except Exception as e:
             logger.error(f"Error making request to {endpoint}: {e}")
             raise
@@ -128,31 +141,29 @@ class DovizcomProvider:
         """
         Get latest asset data from archive endpoint.
         Used for fuel assets that don't have daily data.
+
+        Returns None only when the API answers with no rows. Request failures
+        propagate: swallowing them here is how an HTTP 401 used to reach the
+        caller as "No fuel price data available for this asset".
         """
-        try:
-            # Calculate date range (last N days)
-            end_time = int(time.time())
-            start_time = end_time - (days_back * 24 * 60 * 60)  # N days ago
-            
-            endpoint = f"/assets/{asset}/archive"
-            params = {
-                "start": start_time,
-                "end": end_time
-            }
-            
-            data = await self._make_request(endpoint, asset, params)
-            
-            archive_data = data.get('data', {}).get('archive', [])
-            if not archive_data:
-                return None
-            
-            # Get the most recent entry (last in array)
-            latest = archive_data[-1]
-            return latest
-            
-        except Exception as e:
-            logger.error(f"Error getting archive data for {asset}: {e}")
+        # Calculate date range (last N days)
+        end_time = int(time.time())
+        start_time = end_time - (days_back * 24 * 60 * 60)  # N days ago
+        
+        endpoint = f"/assets/{self._api_key(asset)}/archive"
+        params = {
+            "start": start_time,
+            "end": end_time
+        }
+        
+        data = await self._make_request(endpoint, asset, params)
+        
+        archive_data = data.get('data', {}).get('archive', [])
+        if not archive_data:
             return None
+        
+        # Get the most recent entry (last in array)
+        return archive_data[-1]
     
     async def get_asset_current(self, asset: str) -> DovizcomGuncelSonucu:
         """
@@ -192,7 +203,7 @@ class DovizcomProvider:
                     )
             else:
                 # Use daily endpoint for non-fuel assets
-                endpoint = f"/assets/{asset}/daily"
+                endpoint = f"/assets/{self._api_key(asset)}/daily"
                 params = {"limit": 1}
                 
                 data = await self._make_request(endpoint, asset, params)
@@ -252,7 +263,7 @@ class DovizcomProvider:
             # Limit between 1 and 60
             limit = max(1, min(limit, 60))
             
-            endpoint = f"/assets/{asset}/daily"
+            endpoint = f"/assets/{self._api_key(asset)}/daily"
             params = {"limit": limit}
             
             data = await self._make_request(endpoint, asset, params)
@@ -334,7 +345,7 @@ class DovizcomProvider:
                     error_message="Invalid date format. Use YYYY-MM-DD format."
                 )
             
-            endpoint = f"/assets/{asset}/archive"
+            endpoint = f"/assets/{self._api_key(asset)}/archive"
             params = {
                 "start": start_timestamp,
                 "end": end_timestamp
