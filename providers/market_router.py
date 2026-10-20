@@ -515,6 +515,9 @@ class MarketRouter:
         """
         source = "unknown"
         data_points = []
+        # Why the provider produced nothing, if it said. Folded into the "no data"
+        # error so an upstream 401 isn't reported as a merely empty window.
+        fetch_error: Optional[str] = None
 
         bar_interval = None
         raw_count = None
@@ -690,6 +693,31 @@ class MarketRouter:
             # the same thing in every market (CLAUDE.md #6).
             data_points.sort(key=lambda row: str(row["date"]))
 
+        elif market == MarketType.FX and self._doviz_fallback_asset(symbol):
+            # WTI and pump prices are not in borsapy/canlidoviz. They used to fall into
+            # the branch below, where resolve_fx_asset() rejects them, and the
+            # swallowed ValueError surfaced as a bare "No historical data".
+            source = "doviz.com"
+            asset = self._doviz_fallback_asset(symbol)
+            win_start, win_end = self._resolve_window(period or "1mo", start_date, end_date)
+            win_end = win_end or datetime.now()
+            win_start = win_start or win_end - timedelta(days=self._PERIOD_DAYS["5y"])
+            result = await self._client.get_dovizcom_arsiv_veri(
+                asset, win_start.strftime("%Y-%m-%d"), win_end.strftime("%Y-%m-%d")
+            )
+            fetch_error = result.error_message
+            for v in result.ohlc_verileri:
+                data_points.append({
+                    "date": v.tarih.isoformat() if v.tarih else "",
+                    # doviz.com writes 0 where it has no value: pump prices carry no
+                    # open/high/low at all, and WTI's archive has no open.
+                    "open": v.acilis or None,
+                    "high": v.en_yuksek or None,
+                    "low": v.en_dusuk or None,
+                    "close": v.kapanis,
+                    "volume": None,
+                })
+
         elif market == MarketType.FX:
             import borsapy as bp
             from providers.canonical_series import resolve_fx_asset
@@ -715,6 +743,7 @@ class MarketRouter:
                         })
             except Exception as e:
                 logger.warning(f"FX historical data error for {symbol}: {e}")
+                fetch_error = str(e)
 
         # Forwarding the window to the provider is not enough: BtcTurk's graph API is
         # handed from/to and still answers with a superset (a 07-01..07-10 request came
@@ -739,6 +768,7 @@ class MarketRouter:
             )
             raise DataNotAvailableError(
                 f"No historical data for '{symbol}' ({market.value}) over {window}"
+                + (f": {fetch_error}" if fetch_error else "")
             )
 
         result_dict = {
@@ -814,6 +844,16 @@ class MarketRouter:
         "1d": 1, "5d": 5, "1mo": 30, "3mo": 90, "6mo": 180,
         "1y": 365, "2y": 730, "5y": 1825,
     }
+
+    @staticmethod
+    def _doviz_fallback_asset(symbol: str) -> Optional[str]:
+        """The provider's spelling of `symbol` if it is served by the legacy
+        api.doviz.com client (WTI, diesel, gasoline, lpg), else None."""
+        from providers.borsapy_fx_provider import BorsapyFXProvider
+        folded = str(symbol).casefold()
+        return next(
+            (a for a in BorsapyFXProvider.FALLBACK_ASSETS if a.casefold() == folded), None
+        )
 
     @staticmethod
     def _resolve_window(
@@ -2279,9 +2319,11 @@ class MarketRouter:
                 # An empty-but-successful payload reads to an LLM as "this asset
                 # exists and has no history", which is a far stronger claim than
                 # "the fetch failed". See CLAUDE.md "Common Issues" #7.
+                reason = getattr(result, "error_message", None)
                 raise DataNotAvailableError(
                     f"No historical FX data for '{symbols[0]}' between "
                     f"{start_date or 'start'} and {end_date or 'now'}"
+                    + (f": {reason}" if reason else "")
                 )
             return {
                 "metadata": self._create_metadata(MarketType.FX, symbols, source),
@@ -2308,8 +2350,9 @@ class MarketRouter:
                         # body and the provider swallows it into guncel_deger=None.
                         # Dropping the row silently shipped `successful_count: 1`
                         # with no data at all.
-                        logger.warning(f"FX quote unavailable for {sym}")
-                        failed.append(f"{sym}: no current quote available")
+                        reason = getattr(result, "error_message", None) or "no current quote available"
+                        logger.warning(f"FX quote unavailable for {sym}: {reason}")
+                        failed.append(f"{sym}: {reason}")
                         continue
                     # `sell` was a double lie. borsapy's get_current does not fetch a
                     # quote at all — it asks canlidoviz for a 5-day history and returns

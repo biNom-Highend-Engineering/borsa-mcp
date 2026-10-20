@@ -3,13 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
+import json
 import os
+import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 import httpx
+
+# Imported eagerly rather than inside the probes: those run in worker threads
+# in parallel, and concurrent first imports of borsapy modules can deadlock on
+# Python's import lock.
+from borsapy._providers.dovizcom_calendar import DovizcomCalendarProvider
+from borsapy._providers.dovizcom_tahvil import DovizcomTahvilProvider
+from borsapy._providers.tradingview import get_tradingview_provider
+from borsapy.cache import Cache
 
 
 ResponseValidator = Callable[[httpx.Response], None]
@@ -37,6 +49,14 @@ class Dependency:
     env_json_field: str | None = None
     timeout_seconds: float | None = None
     use_sync_client: bool = False
+    # Query parameters computed per probe, for APIs that need a recent window.
+    params_factory: Callable[[], dict[str, str]] | None = None
+    # Some sites serve their real page with an error status; trust the validator.
+    allow_error_status: bool = False
+    # A check that runs production client code instead of a raw HTTP request,
+    # for websockets or flows such as token handling. A coroutine function is
+    # awaited; a plain function runs in a worker thread. Raise when unusable.
+    probe: Callable[[], Any] | None = None
 
 
 class HealthRateLimited(Exception):
@@ -138,6 +158,151 @@ def _validate_tcmb_inflation(response: httpx.Response) -> None:
         raise ValueError("TCMB returned no inflation rows")
 
 
+def _validate_canlidoviz(response: httpx.Response) -> None:
+    # borsapy reads {"<unix ts>": "open|high|low|close", ...} for FX quotes.
+    payload = response.json()
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError("canlidoviz returned no USD history")
+    latest = payload[max(payload, key=int)]
+    if len([float(value) for value in latest.split("|")]) < 4:
+        raise ValueError("canlidoviz history row is not OHLC")
+
+
+def _canlidoviz_usd_params() -> dict[str, str]:
+    # get_quote reads the latest bar of the last 5 days, so probe a recent window.
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=7)
+    return {
+        "period": "DAILY",
+        "itemDataId": "1",  # USD in borsapy's CanlidovizProvider.CURRENCY_IDS
+        "startDate": start.strftime("%Y-%m-%dT%H:%M:%S"),
+        "endDate": end.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+
+def _validate_hedeffiyat(response: httpx.Response) -> None:
+    # borsapy finds each stock's page through these <option> links on /senetler.
+    if not re.search(r'value="/senet/thyao-[^"]+"', response.text, re.IGNORECASE):
+        raise ValueError("hedeffiyat stock list markup changed")
+
+
+def _validate_bist_index_csv(response: httpx.Response) -> None:
+    # borsapy reads these columns for index components and sector peers.
+    rows = csv.DictReader(io.StringIO(response.text), delimiter=";")
+    missing = {"BILESEN KODU", "ENDEKS KODU"} - set(rows.fieldnames or ())
+    if missing:
+        raise ValueError(f"Borsa Istanbul CSV lacks columns: {', '.join(sorted(missing))}")
+    if not any(row["ENDEKS KODU"] == "XU100" for row in rows):
+        raise ValueError("Borsa Istanbul CSV has no XU100 components")
+
+
+def _validate_btcturk_ohlcs(response: httpx.Response) -> None:
+    # BtcturkProvider.get_ohlc reads a list of bars with OHLC fields.
+    rows = response.json()
+    if not isinstance(rows, list) or not rows or rows[-1].get("close") is None:
+        raise ValueError("BTCTurk Graph API returned no OHLC bars")
+
+
+def _btcturk_ohlcs_params() -> dict[str, str]:
+    now = int(time.time())
+    return {"pair": "BTCTRY", "from": str(now - 7 * 86400), "to": str(now)}
+
+
+def _validate_is_yatirim_statements(response: httpx.Response) -> None:
+    items = response.json().get("value") or []
+    if not any(item.get("value1") is not None for item in items):
+        raise ValueError("Is Yatirim returned no financial statement rows")
+
+
+def _is_yatirim_statement_params() -> dict[str, str]:
+    # Queries for fewer than four periods come back empty, so ask for four
+    # annual periods as borsapy does. Start two years back: that annual report
+    # is published even early in a year.
+    year = datetime.now(timezone.utc).year
+    params = {"companyCode": "THYAO", "exchange": "TRY", "financialGroup": "XI_29"}
+    for index in range(1, 5):
+        params[f"year{index}"] = str(year - 1 - index)
+        params[f"period{index}"] = "12"
+    return params
+
+
+def _ajax_rows(response: httpx.Response) -> list[Any]:
+    # ASP.NET page methods wrap their result as {"d": "<JSON string>"}.
+    raw = response.json().get("d", "[]")
+    return json.loads(raw) if isinstance(raw, str) else raw
+
+
+def _validate_is_yatirim_screener(response: httpx.Response) -> None:
+    rows = _ajax_rows(response)
+    if not rows or "Hisse" not in rows[0]:
+        raise ValueError("Is Yatirim screener returned no stocks")
+
+
+def _validate_is_yatirim_company_info(response: httpx.Response) -> None:
+    if not _ajax_rows(response):
+        raise ValueError("Is Yatirim returned no corporate actions")
+
+
+def _validate_doviz_calendar_page(response: httpx.Response) -> None:
+    # The scrape fallback in BorsapyCalendarProvider reads these tab panes.
+    from providers.borsapy_calendar_provider import CALENDAR_CONTAINERS
+
+    if not any(f'id="{pane}"' in response.text for pane in CALENDAR_CONTAINERS):
+        raise ValueError("doviz.com calendar page markup changed")
+
+
+def _fresh_borsapy(provider_class: Any) -> Any:
+    # borsapy providers share a global response cache by default, which would
+    # let a probe pass on stale data; give each probe an empty one.
+    return provider_class(cache=Cache())
+
+
+def _probe_doviz_calendar_api() -> None:
+    provider = _fresh_borsapy(DovizcomCalendarProvider)
+    try:
+        # borsapy swallows per-country errors, so an outage looks like no events.
+        if not provider.get_economic_calendar(countries=["US"]):
+            raise ValueError("doviz.com calendar API returned no events")
+    finally:
+        provider.close()
+
+
+def _probe_doviz_bonds() -> None:
+    provider = _fresh_borsapy(DovizcomTahvilProvider)
+    try:
+        if not provider.get_bond_yields():
+            raise ValueError("doviz.com returned no bond yields")
+    finally:
+        provider.close()
+
+
+async def _probe_doviz_api() -> None:
+    # WTI and fuel prices go through the legacy api.doviz.com client, whose
+    # bearer token is scraped from doviz.com; exercise that whole flow.
+    from providers.dovizcom_legacy_provider import DovizcomProvider
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:
+        result = await DovizcomProvider(client).get_asset_current("WTI")
+    if result.guncel_deger is None:
+        raise ValueError(result.error_message or "doviz.com API returned no WTI price")
+
+
+def _probe_tradingview_websocket() -> None:
+    # Use borsapy's own websocket client: the same code path that serves BIST
+    # quotes, profiles and index values in production.
+    quote = get_tradingview_provider().get_quote("THYAO")
+    if quote.get("last") is None:
+        raise ValueError("TradingView websocket returned no last price")
+
+
+IS_YATIRIM_AJAX_HEADERS = {
+    "Content-Type": "application/json; charset=UTF-8",
+    "X-Requested-With": "XMLHttpRequest",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Origin": "https://www.isyatirim.com.tr",
+}
+
+
 TCMB_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -212,8 +377,57 @@ DEPENDENCIES: dict[str, Dependency] = {
         validator=_validate_mynet_stock_list,
     ),
     "is_yatirim": Dependency(
-        name="Is Yatirim",
-        url="https://www.isyatirim.com.tr/tr-tr/analiz/hisse/Sayfalar/default.aspx",
+        name="Is Yatirim Financial Statements",
+        url=(
+            "https://www.isyatirim.com.tr/_layouts/15/IsYatirim.Website/"
+            "Common/Data.aspx/MaliTablo"
+        ),
+        validator=_validate_is_yatirim_statements,
+        params_factory=_is_yatirim_statement_params,
+    ),
+    "is_yatirim_screener": Dependency(
+        name="Is Yatirim Screener",
+        url=(
+            "https://www.isyatirim.com.tr/tr-tr/analiz/_Layouts/15/IsYatirim.Website/"
+            "StockInfo/CompanyInfoAjax.aspx/getScreenerDataNEW"
+        ),
+        validator=_validate_is_yatirim_screener,
+        method="POST",
+        # borsapy's default screen: every stock priced above 1 TL.
+        json={
+            "sektor": "",
+            "endeks": "",
+            "takip": "",
+            "oneri": "",
+            "criterias": [["7", "1", "50000", "False"]],
+            "lang": "1055",
+        },
+        headers={
+            **IS_YATIRIM_AJAX_HEADERS,
+            "Referer": (
+                "https://www.isyatirim.com.tr/tr-tr/analiz/hisse/Sayfalar/"
+                "gelismis-hisse-arama.aspx"
+            ),
+        },
+        timeout_seconds=15,
+    ),
+    "is_yatirim_company_info": Dependency(
+        name="Is Yatirim Corporate Actions",
+        url=(
+            "https://www.isyatirim.com.tr/_layouts/15/IsYatirim.Website/"
+            "StockInfo/CompanyInfoAjax.aspx/GetSermayeArttirimlari"
+        ),
+        validator=_validate_is_yatirim_company_info,
+        method="POST",
+        json={
+            "hisseKodu": "THYAO",
+            "hisseTanimKodu": "",
+            "yil": 0,
+            "zaman": "HEPSI",
+            "endeksKodu": "09",
+            "sektorKodu": "",
+        },
+        headers=IS_YATIRIM_AJAX_HEADERS,
     ),
     "tefas": Dependency(
         name="TEFAS",
@@ -235,8 +449,28 @@ DEPENDENCIES: dict[str, Dependency] = {
         validator=_validate_xlsx,
     ),
     "doviz": Dependency(
-        name="Doviz.com",
+        name="Doviz.com Calendar API",
+        url="https://www.doviz.com/calendar/getCalendarEvents",
+        probe=_probe_doviz_calendar_api,
+        timeout_seconds=15,
+    ),
+    "doviz_calendar_page": Dependency(
+        name="Doviz.com Calendar Page",
         url="https://www.doviz.com/ekonomik-takvim",
+        validator=_validate_doviz_calendar_page,
+    ),
+    "doviz_bonds": Dependency(
+        name="Doviz.com Bond Yields",
+        url="https://www.doviz.com/tahvil",
+        probe=_probe_doviz_bonds,
+        timeout_seconds=15,
+    ),
+    "doviz_api": Dependency(
+        name="Doviz.com API",
+        url="https://api.doviz.com/api/v12",
+        probe=_probe_doviz_api,
+        # Token scrape, then the request and one retry after a 401.
+        timeout_seconds=20,
     ),
     "btcturk": Dependency(
         name="BTCTurk",
@@ -245,11 +479,12 @@ DEPENDENCIES: dict[str, Dependency] = {
     ),
     "btcturk_graph": Dependency(
         name="BTCTurk Graph API",
-        url=(
-            "https://graph-api.btcturk.com/v1/klines/history"
-            "?symbol=BTCTRY&resolution=1440&from=1785456000&to=1786060800"
-        ),
-        validator=_validate_json,
+        # get_ohlc serves historical data, technical analysis and the ohlc
+        # action; nothing calls /v1/klines, so probe the endpoint in use.
+        url="https://graph-api.btcturk.com/v1/ohlcs",
+        validator=_validate_btcturk_ohlcs,
+        params_factory=_btcturk_ohlcs_params,
+        headers={"Accept": "application/json"},
     ),
     "coinbase": Dependency(
         name="Coinbase Products",
@@ -318,6 +553,38 @@ DEPENDENCIES: dict[str, Dependency] = {
         required_env="BLS_API_KEY",
         env_json_field="registrationkey",
     ),
+    "tradingview_websocket": Dependency(
+        name="TradingView Websocket",
+        url="wss://data.tradingview.com/socket.io/websocket",
+        probe=_probe_tradingview_websocket,
+        # get_quote waits up to 10s for the first price packet.
+        timeout_seconds=12,
+    ),
+    "canlidoviz": Dependency(
+        name="Canlidoviz",
+        url="https://a.canlidoviz.com/items/history",
+        validator=_validate_canlidoviz,
+        params_factory=_canlidoviz_usd_params,
+        headers={
+            "Accept": "*/*",
+            "Origin": "https://canlidoviz.com",
+            "Referer": "https://canlidoviz.com/",
+        },
+    ),
+    "hedeffiyat": Dependency(
+        name="Hedeffiyat",
+        url="https://www.hedeffiyat.com.tr/senetler",
+        validator=_validate_hedeffiyat,
+        # The stock list is served with HTTP 404; borsapy reads it regardless.
+        allow_error_status=True,
+        headers={"Accept": "text/html,application/xhtml+xml"},
+        timeout_seconds=15,
+    ),
+    "borsa_istanbul_csv": Dependency(
+        name="Borsa Istanbul Index Components",
+        url="https://www.borsaistanbul.com/datum/hisse_endeks_ds.csv",
+        validator=_validate_bist_index_csv,
+    ),
     "eurostat": Dependency(
         name="Eurostat",
         url=(
@@ -327,6 +594,172 @@ DEPENDENCIES: dict[str, Dependency] = {
         validator=_validate_json,
     ),
 }
+
+
+_KEY_BY_NAME = {dependency.name: key for key, dependency in DEPENDENCIES.items()}
+
+
+@dataclass(frozen=True)
+class ToolCheck:
+    """What one tool branch needs from upstream to answer.
+
+    ``requires`` holds groups of dependency keys: every group must have at least
+    one working member, and the members of a group are fallbacks for each other.
+    """
+
+    tool: str
+    branch: str
+    requires: tuple[tuple[str, ...], ...]
+    not_probed: tuple[str, ...] = ()
+
+
+def _tool(
+    tool: str,
+    branch: str,
+    *requires: str | tuple[str, ...],
+    not_probed: tuple[str, ...] = (),
+) -> ToolCheck:
+    groups = tuple((item,) if isinstance(item, str) else item for item in requires)
+    return ToolCheck(tool, branch, groups, not_probed)
+
+
+TOOL_CHECKS: tuple[ToolCheck, ...] = (
+    _tool("search_symbol", "bist", "kap"),
+    _tool("search_symbol", "us", "yahoo_finance"),
+    _tool("search_symbol", "fund", "takasbank"),
+    _tool("search_symbol", "crypto_tr", "btcturk"),
+    _tool("search_symbol", "crypto_global", "coinbase", "coinbase_currencies"),
+    _tool("get_profile", "bist", "tradingview_websocket"),
+    _tool("get_profile", "us", "yahoo_finance"),
+    _tool("get_profile", "fund", "tefas"),
+    _tool("get_quote", "bist", "tradingview_websocket"),
+    _tool("get_quote", "us", "yahoo_finance"),
+    # Currencies and metals come from canlidoviz; WTI and fuel prices are
+    # routed to the legacy doviz.com API (BorsapyFXProvider.FALLBACK_ASSETS).
+    _tool("get_quote", "fx", "canlidoviz"),
+    _tool("get_quote", "fx_energy", "doviz_api"),
+    _tool("get_quote", "crypto_tr", "btcturk"),
+    _tool("get_quote", "crypto_global", "coinbase"),
+    _tool("get_historical_data", "bist", "tradingview_websocket"),
+    _tool("get_historical_data", "us", "yahoo_finance"),
+    # Daily bars come from canlidoviz, intraday bars from the websocket.
+    _tool("get_historical_data", "fx", "canlidoviz", "tradingview_websocket"),
+    _tool("get_historical_data", "fx_energy", "doviz_api"),
+    _tool("get_historical_data", "crypto_tr", "btcturk_graph"),
+    _tool("get_historical_data", "crypto_global", "coinbase"),
+    _tool("get_historical_data", "fund", "tefas"),
+    _tool("get_technical_analysis", "bist", "tradingview_websocket"),
+    _tool("get_technical_analysis", "us", "yahoo_finance"),
+    _tool("get_technical_analysis", "crypto_tr", "btcturk_graph"),
+    _tool("get_technical_analysis", "crypto_global", "coinbase"),
+    _tool("get_analyst_data", "bist", "hedeffiyat"),
+    _tool("get_analyst_data", "us", "yahoo_finance"),
+    # borsapy is tried first, but the router reads fields it never returns, so
+    # the TradingView scanner is what actually answers BIST earnings.
+    _tool("get_earnings", "bist", "tradingview"),
+    _tool("get_earnings", "us", "yahoo_finance"),
+    # borsa_client falls back to Yahoo when Is Yatirim returns no statement.
+    _tool("get_financial_statements", "bist", ("is_yatirim", "yahoo_finance")),
+    _tool("get_financial_statements", "us", "yahoo_finance"),
+    _tool(
+        "get_financial_ratios",
+        "bist",
+        ("is_yatirim", "yahoo_finance"),
+        "tradingview_websocket",
+    ),
+    _tool("get_financial_ratios", "us", "yahoo_finance"),
+    _tool("get_corporate_actions", "bist", "is_yatirim_company_info"),
+    _tool("get_corporate_actions", "us", "yahoo_finance"),
+    _tool("get_news", "bist", "mynet"),
+    _tool("screen_securities", "bist", "is_yatirim_screener", "borsa_istanbul_csv"),
+    _tool("screen_securities", "us", "yahoo_finance"),
+    _tool(
+        "scan_stocks",
+        "bist",
+        "tradingview",
+        "borsa_istanbul_csv",
+        "tradingview_websocket",
+    ),
+    _tool("compare_assets", "all", "kap", "takasbank", "canlidoviz"),
+    _tool(
+        "get_sector_comparison",
+        "bist",
+        "is_yatirim_screener",
+        "borsa_istanbul_csv",
+    ),
+    _tool("get_sector_comparison", "us", "yahoo_finance"),
+    _tool("get_crypto_market", "btcturk", "btcturk"),
+    _tool("get_crypto_market", "btcturk_ohlc", "btcturk_graph"),
+    _tool("get_crypto_market", "coinbase", "coinbase"),
+    # BorsapyCalendarProvider scrapes the calendar page when the API is empty.
+    _tool("get_economic_calendar", "all", ("doviz", "doviz_calendar_page")),
+    _tool("get_bond_yields", "tr", "doviz_bonds"),
+    _tool("get_fund_data", "tefas", "tefas"),
+    _tool("screen_funds", "tefas", "tefas"),
+    _tool("get_index_data", "bist", "tradingview_websocket", "borsa_istanbul_csv"),
+    _tool("get_index_data", "us", "yahoo_finance"),
+    _tool("get_macro_data", "tr_cpi", "tcmb"),
+    _tool("get_macro_data", "tr_ppi", "tcmb_ufe"),
+    _tool("get_macro_data", "tr_calculator", "tcmb_calculator"),
+    # FRED is primary; BLS and Eurostat take over when FRED fails. Without
+    # BLS_API_KEY the provider falls back to anonymous BLS v1 (25 requests/day),
+    # which is too thin to count on, so an unconfigured BLS is no backup here.
+    _tool("get_macro_data", "us", ("fred_us", "bls")),
+    _tool("get_macro_data", "eu", ("fred_eu", "eurostat")),
+    _tool("get_evds_data", "series", "tcmb_evds"),
+)
+
+# Worst first: a tool reports the worst status among its branches.
+_STATUS_RANK = ("down", "unknown", "not_configured", "degraded", "ok", "not_monitored")
+
+
+def _group_status(statuses: list[str]) -> str:
+    if "ok" in statuses:
+        failed = any(status in ("error", "rate_limited") for status in statuses)
+        return "degraded" if failed else "ok"
+    if "not_checked" in statuses:
+        return "unknown"
+    if all(status == "not_configured" for status in statuses):
+        return "not_configured"
+    return "down"
+
+
+def _worst(statuses: list[str]) -> str:
+    return min(statuses, key=_STATUS_RANK.index)
+
+
+def evaluate_tools(results_by_key: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Roll upstream probe results up to tool branches.
+
+    A branch is ``down`` only when some required source has no working
+    alternative; running on a fallback is ``degraded``. Sources that were not
+    probed in this run make a branch ``unknown`` rather than ``down``.
+    """
+    tools: dict[str, Any] = {}
+    for check in TOOL_CHECKS:
+        sources: dict[str, str] = {}
+        group_statuses = []
+        for group in check.requires:
+            statuses = [
+                results_by_key.get(key, {}).get("status", "not_checked")
+                for key in group
+            ]
+            sources.update(zip(group, statuses))
+            group_statuses.append(_group_status(statuses))
+
+        branch: dict[str, Any] = {
+            "status": _worst(group_statuses) if group_statuses else "not_monitored",
+            "sources": sources,
+        }
+        if check.not_probed:
+            branch["not_probed"] = list(check.not_probed)
+        tools.setdefault(check.tool, {"branches": {}})["branches"][check.branch] = branch
+
+    for tool in tools.values():
+        tool["status"] = _worst(
+            [branch["status"] for branch in tool["branches"].values()]
+        )
+    return tools
 
 
 def configured_dependencies() -> list[Dependency]:
@@ -367,6 +800,24 @@ async def _probe(
             }
 
     effective_timeout = dependency.timeout_seconds or timeout_seconds
+    if dependency.probe:
+        try:
+            if asyncio.iscoroutinefunction(dependency.probe):
+                running = dependency.probe()
+            else:
+                running = asyncio.to_thread(dependency.probe)
+            await asyncio.wait_for(running, timeout=effective_timeout)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "latency_ms": round((time.perf_counter() - started) * 1000),
+                "error": _safe_error(exc),
+            }
+        return {
+            "status": "ok",
+            "latency_ms": round((time.perf_counter() - started) * 1000),
+        }
+
     headers = {"User-Agent": "BorsaMCP-HealthCheck/1.0"}
     headers.update(dependency.headers or {})
     if dependency.required_env and dependency.env_header:
@@ -382,6 +833,8 @@ async def _probe(
             "headers": headers,
             "timeout": effective_timeout,
         }
+        if dependency.params_factory:
+            request_kwargs["params"] = dependency.params_factory()
         if payload is not None:
             body = dict(payload)
             if dependency.required_env and dependency.env_json_field:
@@ -410,7 +863,8 @@ async def _probe(
     for payload in payloads:
         try:
             response = await attempt(payload)
-            response.raise_for_status()
+            if not dependency.allow_error_status:
+                response.raise_for_status()
             if dependency.validator:
                 dependency.validator(response)
             return {
@@ -525,8 +979,15 @@ async def check_dependencies(
     timeout_seconds: float | None = None,
     client: httpx.AsyncClient | None = None,
     mcp_app: Any | None = None,
+    tool_aware: bool = False,
 ) -> tuple[dict[str, Any], int]:
-    """Check MCP readiness and dependencies, returning body and HTTP status."""
+    """Check MCP readiness and dependencies, returning body and HTTP status.
+
+    By default any failed dependency makes the check fail, which suits a probe
+    aimed at specific services. With ``tool_aware`` the check fails only when a
+    tool branch has lost every source it can use, so an upstream outage that a
+    fallback covers is reported as ``degraded`` without failing the check.
+    """
     dependencies = dependencies if dependencies is not None else configured_dependencies()
     timeout_seconds = timeout_seconds or float(os.getenv("HEALTHCHECK_TIMEOUT_SECONDS", "5"))
 
@@ -560,17 +1021,37 @@ async def check_dependencies(
         dependency.name: result
         for dependency, result in zip(dependencies, results, strict=True)
     }
-    checks_failed = (
-        any(result["status"] == "error" for result in results)
-        or mcp_result["status"] == "error"
-    )
-    body = {
-        "status": "degraded" if checks_failed else "ok",
+    upstream_failed = any(result["status"] == "error" for result in results)
+    app_failed = mcp_result["status"] == "error"
+    body: dict[str, Any] = {
         "service": "Borsa MCP Server",
         "version": "1.0.0",
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "duration_ms": round((time.perf_counter() - started) * 1000),
         "application": mcp_result,
-        "services": services,
     }
+
+    if not tool_aware:
+        checks_failed = upstream_failed or app_failed
+        body["status"] = "degraded" if checks_failed else "ok"
+        body["services"] = services
+        return body, 503 if checks_failed else 200
+
+    tools = evaluate_tools(
+        {_KEY_BY_NAME.get(name, name): result for name, result in services.items()}
+    )
+    down_tools = [
+        f"{tool_name} ({branch_name})"
+        for tool_name, tool in tools.items()
+        for branch_name, branch in tool["branches"].items()
+        if branch["status"] == "down"
+    ]
+    checks_failed = app_failed or bool(down_tools)
+    if checks_failed:
+        body["status"] = "unhealthy"
+    else:
+        body["status"] = "degraded" if upstream_failed else "ok"
+    body["down_tools"] = down_tools
+    body["tools"] = tools
+    body["services"] = services
     return body, 503 if checks_failed else 200
