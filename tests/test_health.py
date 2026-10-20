@@ -30,10 +30,15 @@ def test_all_external_services_are_checked_by_default(monkeypatch):
         "TCMB EVDS",
         "TCMB Inflation Calculator",
         "Mynet Finans",
-        "Is Yatirim",
+        "Is Yatirim Financial Statements",
+        "Is Yatirim Screener",
+        "Is Yatirim Corporate Actions",
         "TEFAS",
         "Takasbank",
-        "Doviz.com",
+        "Doviz.com Calendar API",
+        "Doviz.com Calendar Page",
+        "Doviz.com Bond Yields",
+        "Doviz.com API",
         "BTCTurk",
         "BTCTurk Graph API",
         "Coinbase Products",
@@ -388,12 +393,31 @@ def test_unconfigured_optional_source_is_not_an_outage():
     assert tools["get_evds_data"]["status"] == "not_configured"
 
 
-def test_unprobed_upstream_is_listed_next_to_a_branch():
-    tools = evaluate_tools(_all_ok())
+def test_unprobed_upstream_is_listed_next_to_a_branch(monkeypatch):
+    import health
 
-    fx_quote = tools["get_quote"]["branches"]["fx"]
+    monkeypatch.setattr(
+        health,
+        "TOOL_CHECKS",
+        (health._tool("get_quote", "fx", "canlidoviz", not_probed=("x",)),),
+    )
+
+    fx_quote = evaluate_tools(_all_ok())["get_quote"]["branches"]["fx"]
     assert fx_quote["status"] == "ok"
-    assert fx_quote["not_probed"] == ["doviz_api"]
+    assert fx_quote["not_probed"] == ["x"]
+
+
+def test_economic_calendar_survives_on_the_page_scrape_when_the_api_fails():
+    tools = evaluate_tools(_all_ok(doviz="error"))
+
+    assert tools["get_economic_calendar"]["status"] == "degraded"
+
+
+def test_energy_quotes_fail_alone_when_the_doviz_api_is_down():
+    tools = evaluate_tools(_all_ok(doviz_api="error"))
+
+    assert tools["get_quote"]["branches"]["fx_energy"]["status"] == "down"
+    assert tools["get_quote"]["branches"]["fx"]["status"] == "ok"
 
 
 def test_branch_without_probed_sources_is_not_monitored(monkeypatch):
@@ -557,3 +581,109 @@ async def test_custom_probe_reports_ok_and_error():
     assert status_code == 503
     assert body["services"]["Socket OK"]["status"] == "ok"
     assert body["services"]["Socket Down"]["error"] == "ValueError: no last price"
+
+
+async def test_endpoint_probes_hit_the_endpoints_tools_use():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        seen[path] = request
+        if path == "/v1/ohlcs":
+            return httpx.Response(200, json=[{"time": 1, "close": 4098622.0}])
+        if path.endswith("/MaliTablo"):
+            return httpx.Response(200, json={"value": [{"itemCode": "1", "value1": 5.1}]})
+        if path.endswith("/getScreenerDataNEW"):
+            return httpx.Response(200, json={"d": json.dumps([{"Hisse": "THYAO - THY"}])})
+        if path.endswith("/GetSermayeArttirimlari"):
+            return httpx.Response(200, json={"d": json.dumps([{"HISSE_KODU": "THYAO"}])})
+        if path == "/ekonomik-takvim":
+            return httpx.Response(200, text='<div id="calendar-content-0"></div>')
+        raise AssertionError(f"Unexpected health request: {request.url}")
+
+    keys = [
+        "btcturk_graph",
+        "is_yatirim",
+        "is_yatirim_screener",
+        "is_yatirim_company_info",
+        "doviz_calendar_page",
+    ]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        body, status_code = await check_dependencies(
+            dependencies=dependencies_for(keys), client=client, timeout_seconds=1
+        )
+
+    assert status_code == 200, body
+    assert seen["/v1/ohlcs"].url.params["pair"] == "BTCTRY"
+    statements = seen["/_layouts/15/IsYatirim.Website/Common/Data.aspx/MaliTablo"]
+    # Fewer than four periods come back empty, so the probe must ask for four.
+    assert {f"year{i}" for i in range(1, 5)} <= set(statements.url.params)
+    assert "year5" not in statements.url.params
+
+
+@pytest.mark.parametrize(
+    ("key", "path", "response"),
+    [
+        ("btcturk_graph", "/v1/ohlcs", httpx.Response(200, json=[])),
+        ("is_yatirim", "/MaliTablo", httpx.Response(200, json={"value": []})),
+        ("is_yatirim_screener", "/getScreenerDataNEW", httpx.Response(200, json={"d": "[]"})),
+        ("is_yatirim_company_info", "/GetSermayeArttirimlari", httpx.Response(200, json={"d": "[]"})),
+        ("doviz_calendar_page", "/ekonomik-takvim", httpx.Response(200, text="<html></html>")),
+    ],
+)
+async def test_endpoint_probes_fail_on_empty_answers(key, path, response):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith(path)
+        return response
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        body, status_code = await check_dependencies(
+            dependencies=dependencies_for([key]), client=client, timeout_seconds=1
+        )
+
+    assert status_code == 503
+    assert body["services"][DEPENDENCIES[key].name]["status"] == "error"
+
+
+async def test_coroutine_probe_is_awaited():
+    calls = []
+
+    async def async_probe():
+        calls.append("ran")
+
+    body, status_code = await check_dependencies(
+        dependencies=[Dependency("Async", "https://example.test", probe=async_probe)],
+        timeout_seconds=1,
+    )
+
+    assert status_code == 200
+    assert calls == ["ran"]
+
+
+async def test_doviz_api_probe_fails_when_no_price_comes_back(monkeypatch):
+    import health
+    from providers import dovizcom_legacy_provider
+
+    class Unauthorized:
+        guncel_deger = None
+        error_message = "HTTP 401"
+
+    async def fake_current(self, asset):
+        assert asset == "WTI"
+        return Unauthorized()
+
+    monkeypatch.setattr(
+        dovizcom_legacy_provider.DovizcomProvider, "get_asset_current", fake_current
+    )
+
+    with pytest.raises(ValueError, match="HTTP 401"):
+        await health._probe_doviz_api()
+
+
+def test_bond_probe_fails_when_doviz_returns_no_yields(monkeypatch):
+    import health
+
+    monkeypatch.setattr(health.DovizcomTahvilProvider, "get_bond_yields", lambda self: [])
+
+    with pytest.raises(ValueError, match="no bond yields"):
+        health._probe_doviz_bonds()
