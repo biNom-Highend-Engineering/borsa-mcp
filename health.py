@@ -25,6 +25,7 @@ from borsapy.cache import Cache
 # The bond tool parses doviz.com/tahvil with this, not with borsapy's own
 # DovizcomTahvilProvider (whose parser is out of date); probe the same code.
 from providers.borsapy_bond_provider import DovizcomBondsPageProvider
+from providers.btcturk_provider import fetch_fallback_bars
 
 
 ResponseValidator = Callable[[httpx.Response], None]
@@ -290,6 +291,13 @@ async def _probe_doviz_api() -> None:
         raise ValueError(result.error_message or "doviz.com API returned no WTI price")
 
 
+def _probe_btcturk_ohlc_fallback() -> None:
+    # The candles BtcTurkProvider serves when graph-api.btcturk.com is empty:
+    # the same pair on Binance through TradingView. Probe that exact code.
+    now = int(time.time())
+    fetch_fallback_bars("BTCTRY", 1440, now - 7 * 86400, now)
+
+
 def _probe_tradingview_websocket() -> None:
     # Use borsapy's own websocket client: the same code path that serves BIST
     # quotes, profiles and index values in production.
@@ -489,6 +497,13 @@ DEPENDENCIES: dict[str, Dependency] = {
         params_factory=_btcturk_ohlcs_params,
         headers={"Accept": "application/json"},
     ),
+    "btcturk_ohlc_fallback": Dependency(
+        name="BTCTurk OHLC Fallback (Binance via TradingView)",
+        url="wss://data.tradingview.com/socket.io/websocket",
+        probe=_probe_btcturk_ohlc_fallback,
+        # get_history waits up to 10s for the first bars.
+        timeout_seconds=12,
+    ),
     "coinbase": Dependency(
         name="Coinbase Products",
         url="https://api.coinbase.com/api/v3/brokerage/market/products",
@@ -648,12 +663,18 @@ TOOL_CHECKS: tuple[ToolCheck, ...] = (
     # Daily bars come from canlidoviz, intraday bars from the websocket.
     _tool("get_historical_data", "fx", "canlidoviz", "tradingview_websocket"),
     _tool("get_historical_data", "fx_energy", "doviz_api"),
-    _tool("get_historical_data", "crypto_tr", "btcturk_graph"),
+    # BtcTurkProvider falls back to Binance candles via TradingView when
+    # graph-api.btcturk.com returns none.
+    _tool("get_historical_data", "crypto_tr", ("btcturk_graph", "btcturk_ohlc_fallback")),
     _tool("get_historical_data", "crypto_global", "coinbase"),
     _tool("get_historical_data", "fund", "tefas"),
     _tool("get_technical_analysis", "bist", "tradingview_websocket"),
     _tool("get_technical_analysis", "us", "yahoo_finance"),
-    _tool("get_technical_analysis", "crypto_tr", "btcturk_graph"),
+    _tool(
+        "get_technical_analysis",
+        "crypto_tr",
+        ("btcturk_graph", "btcturk_ohlc_fallback"),
+    ),
     _tool("get_technical_analysis", "crypto_global", "coinbase"),
     _tool("get_analyst_data", "bist", "hedeffiyat"),
     _tool("get_analyst_data", "us", "yahoo_finance"),
@@ -692,7 +713,11 @@ TOOL_CHECKS: tuple[ToolCheck, ...] = (
     ),
     _tool("get_sector_comparison", "us", "yahoo_finance"),
     _tool("get_crypto_market", "btcturk", "btcturk"),
-    _tool("get_crypto_market", "btcturk_ohlc", "btcturk_graph"),
+    _tool(
+        "get_crypto_market",
+        "btcturk_ohlc",
+        ("btcturk_graph", "btcturk_ohlc_fallback"),
+    ),
     _tool("get_crypto_market", "coinbase", "coinbase"),
     # BorsapyCalendarProvider scrapes the calendar page when the API is empty.
     _tool("get_economic_calendar", "all", ("doviz", "doviz_calendar_page")),

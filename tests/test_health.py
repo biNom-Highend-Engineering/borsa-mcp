@@ -41,6 +41,7 @@ def test_all_external_services_are_checked_by_default(monkeypatch):
         "Doviz.com API",
         "BTCTurk",
         "BTCTurk Graph API",
+        "BTCTurk OHLC Fallback (Binance via TradingView)",
         "Coinbase Products",
         "Coinbase Currencies",
         "World Bank",
@@ -379,6 +380,39 @@ def test_tool_is_down_when_primary_and_fallback_both_fail():
 
     assert tools["get_macro_data"]["branches"]["eu"]["status"] == "down"
     assert tools["get_macro_data"]["status"] == "down"
+
+
+@pytest.mark.parametrize(
+    ("tool", "branch"),
+    [
+        ("get_historical_data", "crypto_tr"),
+        ("get_technical_analysis", "crypto_tr"),
+        ("get_crypto_market", "btcturk_ohlc"),
+    ],
+)
+def test_empty_btcturk_candles_are_covered_by_the_tradingview_fallback(tool, branch):
+    degraded = evaluate_tools(_all_ok(btcturk_graph="error"))
+    down = evaluate_tools(_all_ok(btcturk_graph="error", btcturk_ohlc_fallback="error"))
+
+    assert degraded[tool]["branches"][branch]["status"] == "degraded"
+    assert down[tool]["branches"][branch]["status"] == "down"
+
+
+async def test_btcturk_fallback_probe_runs_the_provider_fallback(monkeypatch):
+    import health
+
+    calls = []
+    monkeypatch.setattr(
+        health, "fetch_fallback_bars", lambda *args: calls.append(args) or [{"close": 1.0}]
+    )
+    body, status_code = await check_dependencies(
+        dependencies=dependencies_for(["btcturk_ohlc_fallback"]), timeout_seconds=1
+    )
+
+    assert status_code == 200, body
+    pair, interval_minutes, from_ts, to_ts = calls[0]
+    assert (pair, interval_minutes) == ("BTCTRY", 1440)
+    assert to_ts - from_ts == 7 * 86400
 
 
 def test_unconfigured_fallback_does_not_cover_a_failed_primary():

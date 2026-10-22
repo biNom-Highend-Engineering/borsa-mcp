@@ -3,12 +3,16 @@ BtcTurk Provider
 This module is responsible for all interactions with the
 BtcTurk Kripto API, including fetching cryptocurrency market data.
 """
+import asyncio
 import httpx
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, List, Union
+# Imported eagerly: the fallback runs in worker threads, and concurrent first
+# imports of borsapy modules can deadlock on Python's import lock.
+from borsapy._providers.tradingview import get_tradingview_provider
 from models import (
     KriptoExchangeInfoSonucu, KriptoTickerSonucu, KriptoOrderbookSonucu,
     KriptoTradesSonucu, KriptoOHLCSonucu, KriptoKlineSonucu, KriptoTeknikAnalizSonucu,
@@ -19,6 +23,72 @@ from models import (
 )
 
 logger = logging.getLogger(__name__)
+
+# graph-api.btcturk.com is the only public source of BtcTurk candles, and it can
+# go silent: on 2026-10-22 it answered every window with an empty list, BtcTurk's
+# own charts included. TradingView does not list BtcTurk, so fall back to the same
+# pair on Binance through TradingView. Those are Binance's prints, not BtcTurk's
+# (BTCTRY closed within 0.1% of BtcTurk's last), so results say where they came from.
+FALLBACK_EXCHANGE = "BINANCE"
+FALLBACK_SOURCE = "binance_via_tradingview"
+FALLBACK_WARNING = (
+    "BtcTurk's candle API returned no data, so these candles are the same pair "
+    "on Binance (via TradingView). Prices track BtcTurk closely but are not "
+    "BtcTurk's own trades, and volumes are Binance volumes."
+)
+
+# Graph API resolution in minutes -> borsapy TradingView interval.
+_FALLBACK_INTERVALS = {
+    1: "1m", 5: "5m", 15: "15m", 30: "30m",
+    60: "1h", 240: "4h", 1440: "1d", 10080: "1wk",
+}
+
+
+def fetch_fallback_bars(
+    pair: str,
+    interval_minutes: int,
+    from_ts: Optional[int],
+    to_ts: Optional[int],
+) -> List[Dict[str, Any]]:
+    """Fetch candles for a BtcTurk pair from Binance through TradingView.
+
+    Blocking (borsapy's websocket client); run it in a worker thread. Returns
+    bars shaped like graph-api's /v1/ohlcs rows, oldest first. Raises when
+    TradingView has no such pair or returns nothing in the window.
+    """
+    symbol = pair.upper().replace("_", "").replace("-", "")
+    interval = _FALLBACK_INTERVALS.get(interval_minutes, "1d")
+    now = int(time.time())
+    to_ts = to_ts or now
+    from_ts = from_ts or to_ts - 30 * 24 * 60 * 60
+
+    # borsapy sizes intraday requests for BIST's 510-minute session; crypto
+    # trades around the clock, so ask from further back to cover the window.
+    # The extra day absorbs borsapy reading a naive start as Istanbul time.
+    lookback = now - from_ts
+    if interval_minutes < 1440:
+        lookback = lookback * 1440 / 510
+    start = datetime.now() - timedelta(seconds=lookback + 24 * 60 * 60)
+
+    df = get_tradingview_provider().get_history(
+        symbol, interval=interval, start=start, exchange=FALLBACK_EXCHANGE
+    )
+    bars = []
+    for ts, row in df.iterrows():
+        bar_time = int(ts.timestamp())
+        if from_ts <= bar_time <= to_ts:
+            bars.append({
+                'time': bar_time,
+                'open': float(row['Open']),
+                'high': float(row['High']),
+                'low': float(row['Low']),
+                'close': float(row['Close']),
+                'volume': float(row['Volume']),
+            })
+    if not bars:
+        raise ValueError(f"{FALLBACK_EXCHANGE}:{symbol} returned no candles in the window")
+    return bars
+
 
 class BtcTurkProvider:
     BASE_URL = "https://api.btcturk.com/api/v2"
@@ -480,10 +550,27 @@ class BtcTurkProvider:
             }
             
             # Direct Graph API call
-            response = await self._http_client.get(url, headers=headers, params=params)
-            response.raise_for_status()
-            data = response.json()
-            
+            source, warning = "btcturk", None
+            try:
+                response = await self._http_client.get(url, headers=headers, params=params)
+                response.raise_for_status()
+                data = response.json()
+                graph_error = None
+            except Exception as e:
+                data, graph_error = [], e
+
+            if not data:
+                try:
+                    data = await asyncio.to_thread(
+                        fetch_fallback_bars, pair, 1440, from_timestamp, to_timestamp
+                    )
+                except Exception as fallback_error:
+                    raise ValueError(
+                        f"BtcTurk returned no candles ({graph_error or 'empty response'}); "
+                        f"{FALLBACK_SOURCE} fallback failed: {fallback_error}"
+                    ) from fallback_error
+                source, warning = FALLBACK_SOURCE, FALLBACK_WARNING
+
             # Calculate time frame for optimization
             time_frame_days = 30  # Default
             if from_timestamp and to_timestamp:
@@ -543,7 +630,9 @@ class BtcTurkProvider:
                 ohlc_data=ohlc_data_list,
                 toplam_veri=len(ohlc_data_list),
                 from_time=from_timestamp,
-                to_time=to_timestamp
+                to_time=to_timestamp,
+                source=source,
+                warning=warning
             )
             
         except Exception as e:
@@ -592,24 +681,49 @@ class BtcTurkProvider:
             }
             
             # Direct Graph API call
-            response = await self._http_client.get(url, headers=headers, params=params)
-            response.raise_for_status()
-            data = response.json()
-            
+            source, warning = "btcturk", None
+            try:
+                response = await self._http_client.get(url, headers=headers, params=params)
+                response.raise_for_status()
+                data = response.json()
+                graph_error = None
+            except Exception as e:
+                data, graph_error = {}, e
+
             # Graph API returns TradingView format
             status = data.get('s', 'error')
-            
-            if status != 'ok':
-                return KriptoKlineSonucu(
-                    symbol=symbol.upper(),
-                    resolution=resolution,
-                    klines=[],
-                    toplam_veri=0,
-                    from_time=from_time,
-                    to_time=to_time,
-                    status=status
-                )
-            
+
+            if status != 'ok' or not data.get('t'):
+                try:
+                    bars = await asyncio.to_thread(
+                        fetch_fallback_bars, symbol, resolution_minutes,
+                        from_timestamp, to_timestamp
+                    )
+                except Exception as fallback_error:
+                    logger.warning(
+                        f"BtcTurk klines for {symbol} empty ({graph_error or status}); "
+                        f"{FALLBACK_SOURCE} fallback failed: {fallback_error}"
+                    )
+                    return KriptoKlineSonucu(
+                        symbol=symbol.upper(),
+                        resolution=resolution,
+                        klines=[],
+                        toplam_veri=0,
+                        from_time=from_time,
+                        to_time=to_time,
+                        status=status,
+                        error_message=(
+                            f"BtcTurk returned no candles ({graph_error or f'status {status}'}); "
+                            f"{FALLBACK_SOURCE} fallback failed: {fallback_error}"
+                        )
+                    )
+                status, source, warning = 'ok', FALLBACK_SOURCE, FALLBACK_WARNING
+                data = {
+                    key: [bar[field] for bar in bars]
+                    for key, field in (('t', 'time'), ('o', 'open'), ('h', 'high'),
+                                       ('l', 'low'), ('c', 'close'), ('v', 'volume'))
+                }
+
             # Parse TradingView format arrays
             timestamps = data.get('t', [])
             opens = data.get('o', [])
@@ -640,7 +754,9 @@ class BtcTurkProvider:
                 toplam_veri=len(klines),
                 from_time=from_timestamp,
                 to_time=to_timestamp,
-                status=status
+                status=status,
+                source=source,
+                warning=warning
             )
             
         except Exception as e:
@@ -711,7 +827,9 @@ class BtcTurkProvider:
             result = KriptoTeknikAnalizSonucu(
                 symbol=symbol.upper(),
                 analiz_tarihi=current_time,
-                resolution=resolution
+                resolution=resolution,
+                source=kline_result.source,
+                warning=kline_result.warning
             )
             
             # Determine market type based on symbol

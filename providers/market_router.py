@@ -521,6 +521,8 @@ class MarketRouter:
 
         bar_interval = None
         raw_count = None
+        # A caveat from the provider about the series, e.g. a fallback venue.
+        provider_warning: Optional[str] = None
 
         if market == MarketType.FUND:
             # The schema promised fund history and the router refused it. The series
@@ -637,6 +639,12 @@ class MarketRouter:
                 from_time=int(win_start.timestamp()) if win_start else None,
                 to_time=int(win_end.timestamp()) if win_end else None,
             )
+            if result and result.source:
+                source = result.source
+            if result and result.warning:
+                provider_warning = result.warning
+            if result and result.error_message:
+                fetch_error = result.error_message
             if result and result.ohlc_data:
                 for dp in result.ohlc_data:
                     data_points.append({
@@ -784,6 +792,8 @@ class MarketRouter:
         }
 
         warnings: List[str] = []
+        if provider_warning:
+            warnings.append(provider_warning)
 
         # Ranges longer than a month are resampled to weekly/monthly bars to bound
         # response size. Without saying so, rows spaced 7 or 30 days apart look like
@@ -943,6 +953,7 @@ class MarketRouter:
         signals = None
         current_price = None
         volume_analysis = None
+        warnings: List[str] = []
 
         if market == MarketType.BIST:
             source = "yfinance"
@@ -1032,6 +1043,12 @@ class MarketRouter:
         elif market == MarketType.CRYPTO_TR:
             source = "btcturk"
             result = await self._client.get_kripto_teknik_analiz(symbol)
+            # BtcTurk's candle API can go empty; the provider then computes from
+            # another venue's candles and says which.
+            if result and result.source:
+                source = result.source
+            if result and result.warning:
+                warnings.append(result.warning)
             if result and result.teknik_indiktorler:
                 ind = result.teknik_indiktorler
                 ma = result.hareketli_ortalamalar
@@ -1095,7 +1112,7 @@ class MarketRouter:
             )
 
         return {
-            "metadata": self._create_metadata(market, symbol, source),
+            "metadata": self._create_metadata(market, symbol, source, warnings=warnings),
             "symbol": symbol.upper(),
             "timeframe": timeframe,
             "current_price": current_price,
@@ -2131,6 +2148,7 @@ class MarketRouter:
         # carrying `error_message`. Carry it up: a failed fetch and an absent quote are
         # different claims, and the callers were treating them as one.
         upstream_error = None
+        warnings: List[str] = []
 
         if exchange == ExchangeType.BTCTURK:
             if data_type == DataType.TICKER:
@@ -2184,6 +2202,12 @@ class MarketRouter:
                     }
             elif data_type == DataType.OHLC:
                 result = await self._client.get_kripto_ohlc(symbol)
+                upstream_error = getattr(result, "error_message", None)
+                # Candles may come from a fallback venue when BtcTurk's are empty.
+                if result and result.source:
+                    source = result.source
+                if result and result.warning:
+                    warnings.append(result.warning)
                 if result and result.ohlc_data:
                     ohlc = [
                         {
@@ -2268,7 +2292,7 @@ class MarketRouter:
             ohlc = ohlc[-100:]
 
         return {
-            "metadata": self._create_metadata(market, symbol, source),
+            "metadata": self._create_metadata(market, symbol, source, warnings=warnings),
             "data_type": data_type.value if hasattr(data_type, 'value') else str(data_type),
             "ticker": ticker,
             "orderbook": orderbook,

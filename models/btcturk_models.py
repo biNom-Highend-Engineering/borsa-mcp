@@ -163,6 +163,8 @@ class KriptoOHLCSonucu(BaseModel):
     ohlc_data: List[KriptoOHLC] = Field(default_factory=list, description="OHLC data points.")
     total_periods: Optional[int] = Field(None, description="Number of periods returned.")
     time_frame: Optional[str] = Field(None, description="Time frame used (e.g., '1d', '1h').")
+    source: Optional[str] = Field(None, description="Where the candles came from (btcturk or a fallback venue).")
+    warning: Optional[str] = Field(None, description="Caveat about the data, e.g. when a fallback venue served it.")
     error_message: Optional[str] = Field(None, description="Error message if operation failed.")
 
 class KriptoKlineRaw(BaseModel):
@@ -200,6 +202,8 @@ class KriptoKlineSonucu(BaseModel):
     from_time: Optional[int] = Field(None, description="Start timestamp.")
     to_time: Optional[int] = Field(None, description="End timestamp.")
     status: Optional[str] = Field(None, description="API status (ok/error).")
+    source: Optional[str] = Field(None, description="Where the candles came from (btcturk or a fallback venue).")
+    warning: Optional[str] = Field(None, description="Caveat about the data, e.g. when a fallback venue served it.")
     error_message: Optional[str] = Field(None, description="Error message if operation failed.")
 
 # --- Technical Analysis Models ---
@@ -261,7 +265,9 @@ class KriptoTeknikAnalizSonucu(BaseModel):
     quote_currency: Optional[str] = Field(None, description="Quote currency (TRY, USDT, BTC, etc.).")
     analysis_time: Optional[datetime.datetime] = Field(None, description="Analysis timestamp.")
     timeframe: Optional[str] = Field(None, description="Analysis timeframe (1M, 5M, 15M, 30M, 1H, 4H, 6H, 1D).")
-    
+    source: Optional[str] = Field(None, description="Where the candles came from (btcturk or a fallback venue).")
+    warning: Optional[str] = Field(None, description="Caveat about the data, e.g. when a fallback venue served it.")
+
     # Price and trend analysis
     fiyat_analizi: Optional[KriptoFiyatAnalizi] = Field(None, description="Price analysis data.")
     trend_analizi: Optional[KriptoTrendAnalizi] = Field(None, description="Trend analysis data.")
