@@ -415,6 +415,15 @@ async def test_btcturk_fallback_probe_runs_the_provider_fallback(monkeypatch):
     assert to_ts - from_ts == 7 * 86400
 
 
+def test_corporate_actions_probe_waits_as_long_as_the_tool_does():
+    # The probe used the 5s default while the tool allowed 10s, and Is Yatirim
+    # often answers in 5-10s: /health went 503 for responses users still got.
+    from providers.isyatirim_provider import IsYatirimProvider
+
+    probe = DEPENDENCIES["is_yatirim_company_info"]
+    assert probe.timeout_seconds == IsYatirimProvider.COMPANY_INFO_TIMEOUT == 15
+
+
 def test_unconfigured_fallback_does_not_cover_a_failed_primary():
     tools = evaluate_tools(_all_ok(fred_us="error", bls="not_configured"))
 
