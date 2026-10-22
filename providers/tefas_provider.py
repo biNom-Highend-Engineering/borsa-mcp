@@ -16,7 +16,10 @@ logger = logging.getLogger(__name__)
 
 class TefasProvider:
     """Provider for TEFAS mutual fund data."""
-    
+
+    # Takasbank fund-list download; the health probe uses the same budget.
+    TAKASBANK_TIMEOUT = 10
+
     def __init__(self):
         self.base_url = "https://www.tefas.gov.tr"
         self.api_url = f"{self.base_url}/api"
@@ -51,7 +54,7 @@ class TefasProvider:
             logger.info("Fetching fresh fund list from Takasbank")
             
             # Download Excel file
-            response = self.session.get(self.takasbank_url, timeout=10)
+            response = self.session.get(self.takasbank_url, timeout=self.TAKASBANK_TIMEOUT)
             response.raise_for_status()
             
             # Save to temp file

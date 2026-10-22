@@ -424,6 +424,32 @@ def test_corporate_actions_probe_waits_as_long_as_the_tool_does():
     assert probe.timeout_seconds == IsYatirimProvider.COMPANY_INFO_TIMEOUT == 15
 
 
+def test_takasbank_probe_waits_as_long_as_the_tool_does():
+    from providers.tefas_provider import TefasProvider
+
+    assert DEPENDENCIES["takasbank"].timeout_seconds == TefasProvider.TAKASBANK_TIMEOUT
+
+
+@pytest.mark.parametrize(
+    ("key", "provider_path"),
+    [
+        ("tefas", "borsapy._providers.tefas.TEFASProvider"),
+        ("borsa_istanbul_csv", "borsapy._providers.bist_index.BistIndexProvider"),
+    ],
+)
+def test_borsapy_backed_probes_wait_as_long_as_borsapy_does(key, provider_path):
+    # A probe with less patience than the tool reports 503 for answers users
+    # still get; on 2026-10-22 these timed out at the 5s default.
+    import importlib
+
+    module_name, class_name = provider_path.rsplit(".", 1)
+    provider = getattr(importlib.import_module(module_name), class_name)()
+    try:
+        assert DEPENDENCIES[key].timeout_seconds == provider._client.timeout.read
+    finally:
+        provider.close()
+
+
 def test_unconfigured_fallback_does_not_cover_a_failed_primary():
     tools = evaluate_tools(_all_ok(fred_us="error", bls="not_configured"))
 
