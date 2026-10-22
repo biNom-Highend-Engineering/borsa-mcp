@@ -1067,6 +1067,10 @@ class IsYatirimProvider:
     # ========== SERMAYE ARTIRIMLARI VE TEMETTÜ (Corporate Actions) ==========
 
     COMPANY_INFO_URL = "https://www.isyatirim.com.tr/_layouts/15/IsYatirim.Website/StockInfo/CompanyInfoAjax.aspx"
+    # GetSermayeArttirimlari often takes 5-10s (2026-10-22: 3 of 4 calls from
+    # Azure took over 5s, one locally 10.1s). borsapy allows 15s for it; so do
+    # we, and the health probe uses the same budget.
+    COMPANY_INFO_TIMEOUT = 15.0
 
     async def get_sermaye_artirimlari_raw(self, ticker_kodu: str, yil: int = 0) -> List[Dict[str, Any]]:
         """
@@ -1090,7 +1094,7 @@ class IsYatirimProvider:
                 "sektorKodu": ""
             }
 
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=self.COMPANY_INFO_TIMEOUT) as client:
                 response = await client.post(
                     url,
                     json=payload,

@@ -439,6 +439,8 @@ DEPENDENCIES: dict[str, Dependency] = {
             "sektorKodu": "",
         },
         headers=IS_YATIRIM_AJAX_HEADERS,
+        # Often answers in 5-10s; IsYatirimProvider.COMPANY_INFO_TIMEOUT allows 15s.
+        timeout_seconds=15,
     ),
     "tefas": Dependency(
         name="TEFAS",
