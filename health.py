@@ -452,6 +452,10 @@ DEPENDENCIES: dict[str, Dependency] = {
             {"fonKodu": code} for code in TEFAS_CANARY_FUNDS[1:]
         ),
         headers={"Accept": "application/json"},
+        # borsapy's TEFASProvider waits 30s per request. Per canary fund, so a
+        # TEFAS that hangs on all three holds /health for up to 90s (the
+        # availability test allows 120s).
+        timeout_seconds=30,
     ),
     "takasbank": Dependency(
         name="Takasbank",
@@ -460,6 +464,8 @@ DEPENDENCIES: dict[str, Dependency] = {
             "ExcelExportTefasFundsTradingInvestmentPlatform?language=tr"
         ),
         validator=_validate_xlsx,
+        # TefasProvider.TAKASBANK_TIMEOUT.
+        timeout_seconds=10,
     ),
     "doviz": Dependency(
         name="Doviz.com Calendar API",
@@ -604,6 +610,8 @@ DEPENDENCIES: dict[str, Dependency] = {
         name="Borsa Istanbul Index Components",
         url="https://www.borsaistanbul.com/datum/hisse_endeks_ds.csv",
         validator=_validate_bist_index_csv,
+        # borsapy's BistIndexProvider waits 30s for this download.
+        timeout_seconds=30,
     ),
     "eurostat": Dependency(
         name="Eurostat",
